@@ -32,17 +32,18 @@ func TestLiveVPNGateExit(t *testing.T) {
 	}
 	defer m.Shutdown()
 	m.waitUp(tunnel)
-	if tunnel.Status != "up" {
+	state := tunnel.snapshot()
+	if state.Status != "up" {
 		configPath := filepath.Join(dir, "sing-box", tunnel.processName()+".json")
 		if output, checkErr := exec.Command(bin, "check", "-c", configPath).CombinedOutput(); checkErr != nil {
-			t.Logf("final node=%s config check=%v\n%s", tunnel.Node.HostName, checkErr, output)
+			t.Logf("final node=%s config check=%v\n%s", state.Node.HostName, checkErr, output)
 		}
 		if logData, readErr := os.ReadFile(filepath.Join(dir, "sing-box", tunnel.processName()+".log")); readErr == nil {
 			t.Logf("sing-box tunnel log:\n%s", logData)
 		}
-		t.Fatalf("VPN Gate 出口未连通: %s", tunnel.Err)
+		t.Fatalf("VPN Gate 出口未连通: %s", state.Err)
 	}
-	if tunnel.ExitIP == "" {
+	if state.ExitIP == "" {
 		t.Fatal("出口 IP 为空")
 	}
 }

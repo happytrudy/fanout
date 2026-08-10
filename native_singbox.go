@@ -8,9 +8,12 @@ import (
 
 func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]any {
 	live := map[string]bool{}
+	states := make(map[*Tunnel]tunnelSnapshot, len(tunnels))
 	for _, t := range tunnels {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		state := t.snapshot()
+		states[t] = state
+		if state.Status == "up" {
+			live[sanitizeTag(state.Node.HostName)] = true
 		}
 	}
 
@@ -26,7 +29,8 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		map[string]any{"type": "block", "tag": "block"},
 	}
 	for _, t := range tunnels {
-		if t.Status != "up" {
+		state := states[t]
+		if state.Status != "up" {
 			continue
 		}
 		// Use the tunnel process' loopback SOCKS. It supports UDP and routes
@@ -36,7 +40,7 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		if serverPort == 0 {
 			// A restored/test tunnel may not have initialized its child yet;
 			// retain the historical public SOCKS fallback for TCP compatibility.
-			serverPort = t.Port
+			serverPort = state.Port
 		}
 		out := map[string]any{
 			"type": "socks", "tag": tunnelTag(t),

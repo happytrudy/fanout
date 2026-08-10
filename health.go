@@ -18,23 +18,24 @@ func (m *Manager) WatchHealth() {
 
 	for range time.Tick(healthInterval) {
 		for _, t := range m.Tunnels() {
-			if t.Status != "up" {
+			state := t.snapshot()
+			if state.Status != "up" {
 				continue
 			}
 			if m.tunnelHealthy(t) {
-				fails[t.Slot] = 0
+				fails[state.Slot] = 0
 				continue
 			}
 
-			fails[t.Slot]++
-			if fails[t.Slot] < healthFailures {
-				log.Printf("隧道 %d (%s) 探测失败 %d 次", t.Slot, t.Node.HostName, fails[t.Slot])
+			fails[state.Slot]++
+			if fails[state.Slot] < healthFailures {
+				log.Printf("隧道 %d (%s) 探测失败 %d 次", state.Slot, state.Node.HostName, fails[state.Slot])
 				continue
 			}
 
-			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.Node.HostName)
-			fails[t.Slot] = 0
-			m.reconnect(t, t.Node.HostName)
+			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", state.Slot, state.Node.HostName)
+			fails[state.Slot] = 0
+			m.reconnect(t, state.Node.HostName, nil)
 		}
 	}
 }
@@ -47,7 +48,7 @@ func (m *Manager) tunnelHealthy(t *Tunnel) bool {
 	if err != nil {
 		return false
 	}
-	return got == t.ExitIP
+	return got == t.snapshot().ExitIP
 }
 
 // reconnect 就地把一条隧道换到别的节点上，保持槽位与端口不变，
@@ -56,23 +57,36 @@ func (m *Manager) tunnelHealthy(t *Tunnel) bool {
 // oldHost 必须是本次重连前那条隧道真正绑着的节点名。调用方若已经
 // 改过 t.Node（比如手动换节点），就要把改之前的名字传进来，
 // 否则 rebind 找不到旧绑定，入站会掉成孤儿。
-func (m *Manager) reconnect(t *Tunnel, oldHost string) {
-	t.Status = "starting"
-	t.Err = "正在换节点重连"
-	t.ExitIP = ""
+func (m *Manager) reconnect(t *Tunnel, oldHost string, replacement *Node) bool {
+	if !t.reconnectMu.TryLock() {
+		return false
+	}
+	t.stateMu.Lock()
+	if t.Status == "stopped" {
+		t.stateMu.Unlock()
+		t.reconnectMu.Unlock()
+		return false
+	}
+	if replacement != nil {
+		t.Node = *replacement
+	}
+	t.Status, t.Err, t.ExitIP = "starting", "正在换节点重连", ""
+	t.stateMu.Unlock()
 
 	t.stopEngine()
 
 	go func() {
+		defer t.reconnectMu.Unlock()
 		// 通知延后到 rebind/resync 之后：那两步会把入站改绑到新节点，
 		// 提前重建配置会因为入站还指着旧节点名而丢掉路由规则
 		m.bringUpPersist(t, false, true)
-		if t.Status != "up" {
+		state := t.snapshot()
+		if state.Status != "up" {
 			return
 		}
 		// 出站 tag 跟着节点名走，换了节点就要把原来指向它的入站重新绑过去，
 		// 否则面板里的路由会指向一个已经不存在的出站。
-		if t.Node.HostName != oldHost {
+		if state.Node.HostName != oldHost {
 			if err := m.rebind(oldHost, t); err != nil {
 				log.Printf("重连后同步入站绑定失败: %v", err)
 			}
@@ -84,4 +98,5 @@ func (m *Manager) reconnect(t *Tunnel, oldHost string) {
 			log.Printf("重连后刷新 sing-box 出站失败: %v", err)
 		}
 	}()
+	return true
 }

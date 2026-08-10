@@ -65,11 +65,12 @@ func (m *Manager) runProvision(job *Job, picks []Node, templateID int) {
 		go func(i int, t *Tunnel) {
 			defer wg.Done()
 			m.waitUp(t)
-			if t.Status == "up" {
-				job.Set(i, "ok", t.ExitIP)
+			state := t.snapshot()
+			if state.Status == "up" {
+				job.Set(i, "ok", state.ExitIP)
 				return
 			}
-			job.Set(i, "failed", firstLine(t.Err))
+			job.Set(i, "failed", firstLine(state.Err))
 		}(i, t)
 	}
 	wg.Wait()
@@ -81,8 +82,11 @@ func (m *Manager) runProvision(job *Job, picks []Node, templateID int) {
 	step := len(picks)
 	var hosts []string
 	for _, t := range started {
-		if t != nil && t.Status == "up" {
-			hosts = append(hosts, t.Node.HostName)
+		if t != nil {
+			state := t.snapshot()
+			if state.Status == "up" {
+				hosts = append(hosts, state.Node.HostName)
+			}
 		}
 	}
 	if len(hosts) == 0 {
@@ -111,7 +115,8 @@ func (m *Manager) waitUp(t *Tunnel) {
 	const maxWait = 5 * time.Minute
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
-		if t.Status == "up" || t.Status == "failed" || t.Status == "stopped" {
+		status := t.snapshot().Status
+		if status == "up" || status == "failed" || status == "stopped" {
 			return
 		}
 		time.Sleep(time.Second)
@@ -125,7 +130,7 @@ func (m *Manager) pickNodes(region string, count int) ([]Node, error) {
 
 	used := map[string]bool{}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.snapshot().Node.HostName] = true
 	}
 
 	var out []Node
@@ -166,7 +171,7 @@ func (m *Manager) Regions() []RegionStat {
 
 	used := map[string]bool{}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.snapshot().Node.HostName] = true
 	}
 
 	byCode := map[string]*RegionStat{}

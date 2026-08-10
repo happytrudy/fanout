@@ -31,20 +31,22 @@ func statePath(dir string) string { return filepath.Join(dir, "state.json") }
 func (m *Manager) saveState() error {
 	var st persistedState
 	for _, t := range m.Tunnels() {
+		state := t.snapshot()
 		// 只跳过用户主动停掉的。starting/failed 的隧道也要存：
 		// 它们正在重连或等着重试，漏存会让重启后凭空少几个出口。
-		if t.Status == "stopped" {
+		if state.Status == "stopped" {
 			continue
 		}
+		cred := t.credential()
 		st.Tunnels = append(st.Tunnels, persistedTunnel{
-			Slot:        t.Slot,
-			Port:        t.Port,
-			HostName:    t.Node.HostName,
-			CountryCode: t.Node.CountryCode,
-			Country:     t.Node.Country,
-			Config:      t.Node.Config,
-			SocksUser:   t.Cred.User,
-			SocksPass:   t.Cred.Pass,
+			Slot:        state.Slot,
+			Port:        state.Port,
+			HostName:    state.Node.HostName,
+			CountryCode: state.Node.CountryCode,
+			Country:     state.Node.Country,
+			Config:      state.Node.Config,
+			SocksUser:   cred.User,
+			SocksPass:   cred.Pass,
 		})
 	}
 

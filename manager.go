@@ -87,7 +87,7 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 	// 端口随机取，避免固定规律撞上机器上的其他服务
 	taken := map[int]bool{}
 	for _, other := range m.tunnels {
-		taken[other.Port] = true
+		taken[other.snapshot().Port] = true
 	}
 	port, err := freeRandomPort(taken)
 	if err != nil {
@@ -147,16 +147,16 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 			if persist {
 				return
 			}
-			t.Status = "failed"
+			t.setStatus("failed", t.snapshot().Err)
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
 			return
 		}
 
-		t.Status = "starting"
-		t.Err = fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds())
-		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.Slot, backoff.Seconds())
+		errText := fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds())
+		t.setStatus("starting", errText)
+		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.snapshot().Slot, backoff.Seconds())
 		time.Sleep(backoff)
 		if !m.tunnelActive(t) {
 			return
@@ -177,25 +177,24 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 	// VPN Gate 是志愿者节点，列表里有相当比例已下线或满员（AUTH_FAILED），
 	// 连不上就顺着候选列表换下一个，不必让用户手动试。
-	candidates := m.candidatesFor(t.Node)
+	candidates := m.candidatesFor(t.snapshot().Node)
 	for i, node := range candidates {
 		if !m.tunnelActive(t) {
 			return false
 		}
 		// 其他隧道可能在重试期间占用了这个节点，跳过以免多个端口撞同一出口 IP
-		if i > 0 && m.nodeInUse(node.HostName, t.Slot) {
+		if i > 0 && m.nodeInUse(node.HostName, t.snapshot().Slot) {
 			continue
 		}
-		t.Node = node
-		t.Status = "starting"
+		t.setNode(node)
+		t.setStatus("starting", "")
 		if i > 0 {
-			t.Err = fmt.Sprintf("已换到第 %d 个候选节点", i+1)
+			t.setStatus("starting", fmt.Sprintf("已换到第 %d 个候选节点", i+1))
 		}
 
 		err := m.tryNode(t)
 		if err == nil {
-			t.Status = "up"
-			t.Err = ""
+			t.setStatus("up", "")
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
@@ -204,7 +203,7 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 			}
 			return true
 		}
-		t.Err = err.Error()
+		t.setStatus("starting", err.Error())
 		t.stopEngine()
 	}
 	return false
@@ -214,7 +213,7 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 // 用指针比对：Stop 会从 map 里删除并把 Status 置 stopped，
 // 重连循环据此退出，避免对着一条已经不存在的隧道空转。
 func (m *Manager) tunnelActive(t *Tunnel) bool {
-	if t.Status == "stopped" {
+	if t.snapshot().Status == "stopped" {
 		return false
 	}
 	m.mu.RLock()
@@ -231,7 +230,7 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	if err := t.startSingBox(m.singBoxBin, m.workDir); err != nil {
 		return err
 	}
-	if t.listener == nil {
+	if !t.hasListener() {
 		if err := t.serve(); err != nil {
 			return err
 		}
@@ -240,7 +239,7 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	if err != nil {
 		return err
 	}
-	t.ExitIP = ip
+	t.setExitIP(ip)
 	return nil
 }
 
@@ -252,7 +251,7 @@ func (m *Manager) candidatesFor(first Node) []Node {
 
 	used := map[string]bool{first.HostName: true}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.snapshot().Node.HostName] = true
 	}
 
 	// 地区决定了备选范围，缺失时先从当前列表补一次，
@@ -315,18 +314,19 @@ func (m *Manager) Swap(slot int) error {
 	if !ok {
 		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
-	if t.Status == "starting" {
+	state := t.snapshot()
+	if state.Status == "starting" {
 		return fmt.Errorf("这个出口正在连接中，稍等一下")
 	}
 
 	// pickNodes 已排除所有在用节点，拿到的必然不是当前这个
-	picks, err := m.pickNodes(t.Node.CountryCode, 1)
+	picks, err := m.pickNodes(state.Node.CountryCode, 1)
 	if err != nil {
 		return err
 	}
-	oldHost := t.Node.HostName
-	t.Node = picks[0]
-	m.reconnect(t, oldHost)
+	if !m.reconnect(t, state.Node.HostName, &picks[0]) {
+		return fmt.Errorf("这个出口正在重连中，稍等一下")
+	}
 	return nil
 }
 
@@ -386,7 +386,7 @@ func (m *Manager) nodeInUse(host string, exceptSlot int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for slot, t := range m.tunnels {
-		if slot != exceptSlot && t.Node.HostName == host {
+		if slot != exceptSlot && t.snapshot().Node.HostName == host {
 			return true
 		}
 	}

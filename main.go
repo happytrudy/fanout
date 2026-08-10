@@ -171,7 +171,12 @@ func apiNodes(m *Manager) http.HandlerFunc {
 
 func apiTunnels(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, m.Tunnels())
+		tunnels := m.Tunnels()
+		view := make([]tunnelSnapshot, 0, len(tunnels))
+		for _, t := range tunnels {
+			view = append(view, t.snapshot())
+		}
+		writeJSON(w, http.StatusOK, view)
 	}
 }
 
@@ -190,7 +195,7 @@ func apiStart(m *Manager) http.HandlerFunc {
 					writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 					return
 				}
-				writeJSON(w, http.StatusOK, t)
+				writeJSON(w, http.StatusOK, t.snapshot())
 				return
 			}
 		}
@@ -478,8 +483,9 @@ func apiXUIInbounds(m *Manager) http.HandlerFunc {
 func liveHosts(m *Manager) map[string]bool {
 	live := map[string]bool{}
 	for _, t := range m.Tunnels() {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		state := t.snapshot()
+		if state.Status == "up" {
+			live[sanitizeTag(state.Node.HostName)] = true
 		}
 	}
 	return live
@@ -528,8 +534,9 @@ func apiXUIClone(m *Manager) http.HandlerFunc {
 			}
 		} else {
 			for _, t := range tunnels {
-				if t.Status == "up" {
-					hosts = append(hosts, t.Node.HostName)
+				state := t.snapshot()
+				if state.Status == "up" {
+					hosts = append(hosts, state.Node.HostName)
 				}
 			}
 		}

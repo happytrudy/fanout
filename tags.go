@@ -5,7 +5,7 @@ import "strings"
 const tunnelTagPrefix = "fanout-"
 
 func tunnelTag(t *Tunnel) string {
-	return tunnelTagPrefix + sanitizeTag(t.Node.HostName)
+	return tunnelTagPrefix + sanitizeTag(t.snapshot().Node.HostName)
 }
 
 func sanitizeTag(name string) string {
@@ -22,16 +22,17 @@ func sanitizeTag(name string) string {
 }
 
 func exitLabel(t *Tunnel) string {
-	region := t.Node.CountryCode
+	state := t.snapshot()
+	region := state.Node.CountryCode
 	if region == "" {
-		region = t.Node.Country
+		region = state.Node.Country
 	}
-	suffix := t.Node.HostName
-	if t.ExitIP != "" {
-		if i := strings.LastIndex(t.ExitIP, "."); i >= 0 {
-			suffix = t.ExitIP[i+1:]
+	suffix := state.Node.HostName
+	if state.ExitIP != "" {
+		if i := strings.LastIndex(state.ExitIP, "."); i >= 0 {
+			suffix = state.ExitIP[i+1:]
 		} else {
-			suffix = t.ExitIP
+			suffix = state.ExitIP
 		}
 	}
 	if region == "" {

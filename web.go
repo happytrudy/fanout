@@ -73,7 +73,8 @@ main{padding:14px 16px 40px;max-width:1180px;margin:0 auto}
 .orphan .top h3{font-size:12px;margin:0;font-weight:600;color:var(--dim)}
 .socks{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
 .socks button{background:transparent;border-color:transparent;color:var(--dim);
-  font-size:12px;padding:2px 6px;font-variant-numeric:tabular-nums}
+  font-size:12px;padding:2px 6px;font-variant-numeric:tabular-nums;max-width:440px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
 .socks button:hover:not(:disabled){color:var(--accent);border-color:var(--line)}
 .socks button .lock{width:11px;height:11px;stroke-width:2}
 .acts{display:flex;gap:2px;justify-self:end}
@@ -580,14 +581,17 @@ function renderExits(){
     // 国家码和全名一起显示是冗余的，只在两者确实不同时才补全名
     const place = e.country && e.country.toUpperCase() !== (e.region || '').toUpperCase()
       ? esc(e.region) + ' ' + esc(e.country) : esc(e.region || '—');
+    const socks = e.status === 'up'
+      ? socksURL(credHost(e), e.port, e.socks_user, e.socks_pass)
+      : (e.status === 'starting' ? 'SOCKS5 连接中…' : 'SOCKS5 不可用');
     return '<div class="exit">'
       + '<div class="row">'
       +   '<span class="dot ' + e.status + '" title="' + (STATUS[e.status] || e.status) + '"></span>'
       +   '<span class="ip">' + esc(label) + '</span>'
       +   '<span class="meta">' + place + ' · ' + esc(e.host) + '</span>'
       +   '<span class="chips">' + chips + '</span>'
-      +   '<span class="socks"><button data-cred="' + e.slot + '" title="SOCKS5 访问凭据">'
-      +     ICON.lock + ':' + e.port + '</button></span>'
+      +   '<span class="socks"><button data-cred="' + e.slot + '" title="点击修改 SOCKS5 凭据">'
+      +     ICON.lock + ' ' + esc(socks) + '</button></span>'
       +   '<span class="acts">'
       +     '<button class="icon" data-swap="' + e.slot + '" title="换一个节点">' + ICON.redo + '</button>'
       +     '<button class="icon" data-stop="' + e.slot + '" title="停止这个出口">' + ICON.stop + '</button>'

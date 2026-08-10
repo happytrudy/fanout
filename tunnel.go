@@ -34,6 +34,42 @@ type Tunnel struct {
 	endpointPort int
 	proc         *singBoxProc
 	mu           sync.Mutex
+	stateMu      sync.RWMutex
+	reconnectMu  sync.Mutex
+}
+
+type tunnelSnapshot struct {
+	Slot   int       `json:"slot"`
+	Port   int       `json:"port"`
+	Node   Node      `json:"node"`
+	Status string    `json:"status"`
+	ExitIP string    `json:"exit_ip"`
+	Err    string    `json:"err,omitempty"`
+	Since  time.Time `json:"since"`
+}
+
+func (t *Tunnel) snapshot() tunnelSnapshot {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+	return tunnelSnapshot{Slot: t.Slot, Port: t.Port, Node: t.Node, Status: t.Status, ExitIP: t.ExitIP, Err: t.Err, Since: t.Since}
+}
+
+func (t *Tunnel) setStatus(status, errText string) {
+	t.stateMu.Lock()
+	t.Status, t.Err = status, errText
+	t.stateMu.Unlock()
+}
+
+func (t *Tunnel) setNode(node Node) {
+	t.stateMu.Lock()
+	t.Node = node
+	t.stateMu.Unlock()
+}
+
+func (t *Tunnel) setExitIP(ip string) {
+	t.stateMu.Lock()
+	t.ExitIP = ip
+	t.stateMu.Unlock()
 }
 
 func (t *Tunnel) processName() string { return fmt.Sprintf("tunnel-%d", t.Slot) }
@@ -67,7 +103,8 @@ func (t *Tunnel) startSingBox(bin, workDir string) error {
 	proc := t.proc
 	t.mu.Unlock()
 
-	cfg, err := buildTunnelSingBoxConfig(t.Node.Config, port)
+	state := t.snapshot()
+	cfg, err := buildTunnelSingBoxConfig(state.Node.Config, port)
 	if err != nil {
 		return fmt.Errorf("转换 VPN Gate 配置失败: %w", err)
 	}
@@ -105,6 +142,12 @@ func (t *Tunnel) internalProxyPort() int {
 	return t.endpointPort
 }
 
+func (t *Tunnel) hasListener() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.listener != nil
+}
+
 func (t *Tunnel) dial(network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" {
 		return nil, fmt.Errorf("只支持 TCP")
@@ -119,25 +162,29 @@ func (t *Tunnel) dial(network, addr string) (net.Conn, error) {
 // serve keeps the public SOCKS5 socket in fanout so credentials can be changed
 // without restarting the OpenVPN endpoint.
 func (t *Tunnel) serve() error {
+	state := t.snapshot()
+	publicPort := state.Port
 	var ln net.Listener
 	var err error
 	for i := 0; i < 6; i++ {
-		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", t.Port))
+		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", publicPort))
 		if err == nil {
 			break
 		}
 		time.Sleep(time.Second)
 	}
 	if err != nil {
-		port, perr := freeRandomPort(map[int]bool{t.Port: true})
+		port, perr := freeRandomPort(map[int]bool{publicPort: true})
 		if perr != nil {
-			return fmt.Errorf("监听 %d 失败且无备用端口: %w", t.Port, err)
+			return fmt.Errorf("监听 %d 失败且无备用端口: %w", publicPort, err)
 		}
 		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 		if err != nil {
 			return fmt.Errorf("监听 %d 失败: %w", port, err)
 		}
+		t.stateMu.Lock()
 		t.Port = port
+		t.stateMu.Unlock()
 	}
 	t.mu.Lock()
 	t.listener = ln
@@ -224,8 +271,8 @@ func (t *Tunnel) stop() {
 	t.mu.Lock()
 	ln := t.listener
 	t.listener = nil
-	t.Status = "stopped"
 	t.mu.Unlock()
+	t.setStatus("stopped", "")
 	if ln != nil {
 		_ = ln.Close()
 	}
