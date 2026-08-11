@@ -5,7 +5,7 @@ set -uo pipefail
 WORK_DIR=/var/lib/fanout
 SERVICE=fanout
 BIN=/usr/local/bin/fanout
-REPO="${REPO:-byJoey/fanout}"
+REPO="${REPO:-happytrudy/fanout}"
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; B='\033[0;36m'; D='\033[2m'; N='\033[0m'
 
@@ -234,7 +234,7 @@ show_links() {
   echo -e "  交流群  ${B}https://t.me/+ft-zI76oovgwNmRh${N}"
   echo -e "  油管    ${B}https://youtube.com/@joeyblog${N}"
   echo -e "  博客    ${B}https://joeyblog.net${N}"
-  echo -e "  项目    ${B}https://github.com/byJoey/fanout${N}"
+  echo -e "  项目    ${B}https://github.com/happytrudy/fanout${N}"
   echo
   echo -e "  ${D}用着有问题、或者想要什么功能，去群里说或提 issue。${N}"
 }

@@ -5,7 +5,15 @@ import "strings"
 const tunnelTagPrefix = "fanout-"
 
 func tunnelTag(t *Tunnel) string {
-	return tunnelTagPrefix + sanitizeTag(t.snapshot().Node.HostName)
+	return tunnelTagPrefix + tunnelBinding(t)
+}
+
+func tunnelBinding(t *Tunnel) string {
+	state := t.snapshot()
+	if state.RouteID != "" {
+		return state.RouteID
+	}
+	return sanitizeTag(state.Node.HostName)
 }
 
 func sanitizeTag(name string) string {

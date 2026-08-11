@@ -11,6 +11,7 @@ import (
 // 只存重建所需的信息，运行态（进程、监听）重启后重新建立。
 type persistedTunnel struct {
 	Slot        int    `json:"slot"`
+	RouteID     string `json:"route_id,omitempty"`
 	Port        int    `json:"port"`
 	HostName    string `json:"hostname"`
 	CountryCode string `json:"country_code"`
@@ -40,6 +41,7 @@ func (m *Manager) saveState() error {
 		cred := t.credential()
 		st.Tunnels = append(st.Tunnels, persistedTunnel{
 			Slot:        state.Slot,
+			RouteID:     state.RouteID,
 			Port:        state.Port,
 			HostName:    state.Node.HostName,
 			CountryCode: state.Node.CountryCode,
@@ -83,6 +85,7 @@ func (m *Manager) restoreState() (int, error) {
 		known[n.HostName] = n
 	}
 
+	restored := make([]*Tunnel, 0, len(st.Tunnels))
 	for _, p := range st.Tunnels {
 		node, ok := known[p.HostName]
 		if !ok {
@@ -103,16 +106,33 @@ func (m *Manager) restoreState() (int, error) {
 			}
 			cred = gen
 		}
+		routeID := p.RouteID
+		if routeID == "" {
+			token, err := randomToken(6)
+			if err != nil {
+				return 0, fmt.Errorf("生成出口路由标识失败: %w", err)
+			}
+			routeID = "exit-" + token
+		}
 		t := &Tunnel{
-			Slot:   p.Slot,
-			Port:   p.Port,
-			Node:   node,
-			Status: "starting",
-			Cred:   cred,
+			Slot:    p.Slot,
+			RouteID: routeID,
+			Port:    p.Port,
+			Node:    node,
+			Status:  "starting",
+			Cred:    cred,
 		}
 		m.mu.Lock()
 		m.tunnels[p.Slot] = t
 		m.mu.Unlock()
+		restored = append(restored, t)
+	}
+	// Legacy state files receive Route IDs during restore. Persist them before
+	// dialing so a crash during the first reconnect cannot orphan migrated binds.
+	if err := m.saveState(); err != nil {
+		return 0, fmt.Errorf("保存恢复后的状态失败: %w", err)
+	}
+	for _, t := range restored {
 		go m.bringUpPersist(t, true, true)
 	}
 	return len(st.Tunnels), nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +17,27 @@ import (
 
 // version 由构建时通过 -ldflags 注入。
 var version = "dev"
+
+func requireWriteRequest(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只允许 POST"})
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if referer := r.Header.Get("Referer"); referer != "" {
+			origin = referer
+		}
+	}
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || u.Host != r.Host {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "跨站请求被拒绝"})
+			return false
+		}
+	}
+	return true
+}
 
 func main() {
 	var (
@@ -182,6 +204,9 @@ func apiTunnels(m *Manager) http.HandlerFunc {
 
 func apiStart(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		host := r.URL.Query().Get("host")
 		if host == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 host 参数"})
@@ -205,6 +230,9 @@ func apiStart(m *Manager) http.HandlerFunc {
 
 func apiStop(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		slot, err := strconv.Atoi(r.URL.Query().Get("slot"))
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slot 参数无效"})
@@ -220,6 +248,9 @@ func apiStop(m *Manager) http.HandlerFunc {
 
 func apiRefresh(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		n, err := m.RefreshNodes()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -232,6 +263,9 @@ func apiRefresh(m *Manager) http.HandlerFunc {
 // apiSwap 就地把一个出口换到别的节点，端口不变。
 func apiSwap(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		slot, err := strconv.Atoi(r.URL.Query().Get("slot"))
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slot 参数无效"})
@@ -255,6 +289,9 @@ func apiRegions(m *Manager) http.HandlerFunc {
 // apiCred 改一个出口的 SOCKS5 用户名口令。两个参数都留空表示随机重置。
 func apiCred(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		q := r.URL.Query()
 		slot, err := strconv.Atoi(q.Get("slot"))
 		if err != nil {
@@ -288,64 +325,120 @@ func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 		InboundPortMax *int    `json:"inbound_port_max"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只允许 GET 或 POST"})
+			return
+		}
 		if r.Method == http.MethodPost {
+			if !requireWriteRequest(w, r) {
+				return
+			}
 			var in settingsReq
 			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
 				return
 			}
 
-			// 改口令
+			oldWeb := getWebSettings()
+			nextWeb := oldWeb
+			if in.Port != nil {
+				nextWeb.Port = *in.Port
+			}
+			if in.ListenAddr != nil {
+				nextWeb.ListenAddr = *in.ListenAddr
+			}
+			if in.InboundPortMin != nil {
+				nextWeb.InboundPortMin = *in.InboundPortMin
+			}
+			if in.InboundPortMax != nil {
+				nextWeb.InboundPortMax = *in.InboundPortMax
+			}
+			if err := validatePort(nextWeb.Port); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if _, err := normalizeListenAddr(nextWeb.ListenAddr); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if err := validatePortRange(nextWeb.InboundPortMin, nextWeb.InboundPortMax); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+
+			newPassword := ""
 			if in.Password != nil && *in.Password != "" {
-				if err := auth.SetPassword(*in.Password); err != nil {
+				newPassword = *in.Password
+				if err := validatePassword(newPassword); err != nil {
 					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
 				}
 			}
-			// 改访问路径
+			newBasePath := currentBasePath()
 			if in.BasePath != nil {
-				if _, err := setBasePath(*in.BasePath); err != nil {
+				var err error
+				newBasePath, err = validateBasePath(*in.BasePath)
+				if err != nil {
 					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
 				}
 			}
-			// 改端口 / 监听地址：合成一份新的 WebSettings 一起应用，避免绑两次
-			if in.Port != nil || in.ListenAddr != nil {
-				next := getWebSettings()
-				if in.Port != nil {
-					next.Port = *in.Port
-				}
-				if in.ListenAddr != nil {
-					next.ListenAddr = *in.ListenAddr
-				}
-				if err := srv.applyWebSettings(next); err != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-					return
-				}
-			}
-			if in.InboundPortMin != nil || in.InboundPortMax != nil {
-				next := getWebSettings()
-				if in.InboundPortMin != nil {
-					next.InboundPortMin = *in.InboundPortMin
-				}
-				if in.InboundPortMax != nil {
-					next.InboundPortMax = *in.InboundPortMax
-				}
-				if err := validatePortRange(next.InboundPortMin, next.InboundPortMax); err != nil {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-					return
-				}
-				p, err := openPanel()
+
+			rangeChanged := nextWeb.InboundPortMin != oldWeb.InboundPortMin || nextWeb.InboundPortMax != oldWeb.InboundPortMax
+			var panel Panel
+			if rangeChanged {
+				var err error
+				panel, err = openPanel()
 				if err != nil {
 					writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 					return
 				}
-				if err := p.SetInboundPortRange(next.InboundPortMin, next.InboundPortMax); err != nil {
+			}
+
+			oldPassword, oldBasePath := auth.currentPassword(), currentBasePath()
+			passwordChanged, basePathChanged, webChanged := false, false, false
+			rollback := func() {
+				if webChanged {
+					_ = srv.applyWebSettings(oldWeb)
+				}
+				if rangeChanged && panel != nil {
+					_ = panel.SetInboundPortRange(oldWeb.InboundPortMin, oldWeb.InboundPortMax)
+				}
+				if basePathChanged {
+					_, _ = setBasePath(oldBasePath)
+				}
+				if passwordChanged {
+					_ = auth.SetPassword(oldPassword)
+				}
+			}
+
+			if newPassword != "" {
+				if err := auth.SetPassword(newPassword); err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				passwordChanged = true
+			}
+			if newBasePath != oldBasePath {
+				if _, err := setBasePath(newBasePath); err != nil {
+					rollback()
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				basePathChanged = true
+			}
+			if nextWeb != oldWeb {
+				if err := srv.applyWebSettings(nextWeb); err != nil {
+					rollback()
 					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
 				}
-				if err := setInboundPortRangeSettings(next.InboundPortMin, next.InboundPortMax); err != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				webChanged = true
+			}
+			if rangeChanged {
+				if err := panel.SetInboundPortRange(nextWeb.InboundPortMin, nextWeb.InboundPortMax); err != nil {
+					rollback()
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 					return
 				}
 			}
@@ -380,6 +473,9 @@ func apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 
 // apiUpdateApply 下载最新版替换二进制并重启服务。成功后进程会被拉起成新版本。
 func apiUpdateApply(w http.ResponseWriter, r *http.Request) {
+	if !requireWriteRequest(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
 		return
@@ -411,6 +507,9 @@ func apiExits(m *Manager) http.HandlerFunc {
 // apiProvision 接收"开 N 个某地区的出口"这个意图，返回作业 id 供轮询。
 func apiProvision(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		q := r.URL.Query()
 		count, err := strconv.Atoi(q.Get("count"))
 		if err != nil {
@@ -443,6 +542,9 @@ func apiJobs(m *Manager) http.HandlerFunc {
 
 func apiJobDismiss(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		m.jobs.Dismiss(r.URL.Query().Get("id"))
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "已关闭"})
 	}
@@ -485,7 +587,7 @@ func liveHosts(m *Manager) map[string]bool {
 	for _, t := range m.Tunnels() {
 		state := t.snapshot()
 		if state.Status == "up" {
-			live[sanitizeTag(state.Node.HostName)] = true
+			live[tunnelBinding(t)] = true
 		}
 	}
 	return live
@@ -494,6 +596,9 @@ func liveHosts(m *Manager) map[string]bool {
 // apiXUIBind binds an inbound to one tunnel; an empty host unbinds it.
 func apiXUIBind(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		tag := r.URL.Query().Get("tag")
 		if tag == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 tag 参数"})
@@ -517,6 +622,9 @@ func apiXUIBind(m *Manager) http.HandlerFunc {
 // apiXUIClone copies an inbound to selected live tunnels.
 func apiXUIClone(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		id, err := strconv.Atoi(r.URL.Query().Get("id"))
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 参数无效"})
@@ -645,6 +753,9 @@ func apiXUILinks(w http.ResponseWriter, r *http.Request) {
 // apiXUIDelete 删除入站。停掉出口后它的入站会留下来，用户需要一个清理入口。
 func apiXUIDelete(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		var ids []int
 		for _, part := range strings.Split(r.URL.Query().Get("ids"), ",") {
 			if n, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
@@ -673,6 +784,9 @@ func apiXUIDelete(m *Manager) http.HandlerFunc {
 // apiInboundUpdate changes an inbound's port, remark, or enabled state.
 func apiInboundUpdate(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		p, err := openPanel()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -718,6 +832,9 @@ func apiInboundUpdate(m *Manager) http.HandlerFunc {
 func clientAction(m *Manager, what string,
 	do func(p Panel, id int, email string, tunnels []*Tunnel) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		p, err := openPanel()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -758,6 +875,9 @@ func apiClientReset(m *Manager) http.HandlerFunc {
 
 func apiInboundCreate(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
 		p, err := openPanel()
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})

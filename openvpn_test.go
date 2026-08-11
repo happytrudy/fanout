@@ -96,14 +96,31 @@ func TestSplitOpenVPNLine(t *testing.T) {
 	}
 }
 
-func TestTunnelConfigRoutesInternalSocksToVPN(t *testing.T) {
-	cfg, err := buildTunnelSingBoxConfig(testVPNGateProfile, 12345)
+func TestTunnelConfigRoutesPublicAndInternalSocksToVPN(t *testing.T) {
+	cred := SocksCred{User: "public-user", Pass: "public-password"}
+	cfg, err := buildTunnelSingBoxConfig(testVPNGateProfile, 12345, 23456, cred)
 	if err != nil {
 		t.Fatal(err)
 	}
-	inbound := cfg["inbounds"].([]any)[0].(map[string]any)
-	if inbound["listen"] != "127.0.0.1" || inbound["listen_port"] != 12345 {
-		t.Fatalf("内部 SOCKS 监听错误: %+v", inbound)
+	inbounds := cfg["inbounds"].([]any)
+	if len(inbounds) != 2 {
+		t.Fatalf("SOCKS 入站数量 = %d，want 2", len(inbounds))
+	}
+	internal := inbounds[0].(map[string]any)
+	if internal["listen"] != "127.0.0.1" || internal["listen_port"] != 12345 {
+		t.Fatalf("内部 SOCKS 监听错误: %+v", internal)
+	}
+	public := inbounds[1].(map[string]any)
+	if public["listen"] != "0.0.0.0" || public["listen_port"] != 23456 {
+		t.Fatalf("公网 SOCKS 监听错误: %+v", public)
+	}
+	users := public["users"].([]any)
+	if len(users) != 1 {
+		t.Fatalf("公网 SOCKS 凭据错误: %+v", users)
+	}
+	user := users[0].(map[string]any)
+	if user["username"] != cred.User || user["password"] != cred.Pass {
+		t.Fatalf("公网 SOCKS 凭据错误: %+v", users)
 	}
 	rules := cfg["route"].(map[string]any)["rules"].([]any)
 	if len(rules) < 2 {
@@ -114,8 +131,14 @@ func TestTunnelConfigRoutesInternalSocksToVPN(t *testing.T) {
 		t.Fatalf("未强制 IPv4 DNS 解析: %+v", resolve)
 	}
 	rule := rules[1].(map[string]any)
-	if rule["outbound"] != "vpn" {
+	if rule["outbound"] != "vpn" || len(rule["inbound"].([]string)) != 2 {
 		t.Fatalf("路由未指向 OpenVPN endpoint: %+v", rule)
+	}
+}
+
+func TestTunnelConfigRejectsEmptyPublicCredential(t *testing.T) {
+	if _, err := buildTunnelSingBoxConfig(testVPNGateProfile, 12345, 23456, SocksCred{}); err == nil {
+		t.Fatal("空公网 SOCKS 凭据不应生成配置")
 	}
 }
 
@@ -124,7 +147,7 @@ func TestTunnelConfigPassesSingBoxCheck(t *testing.T) {
 	if bin == "" {
 		t.Skip("FANOUT_SINGBOX_BIN 未设置")
 	}
-	cfg, err := buildTunnelSingBoxConfig(testVPNGateProfile, 12345)
+	cfg, err := buildTunnelSingBoxConfig(testVPNGateProfile, 12345, 23456, SocksCred{User: "test", Pass: "password"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -100,14 +100,14 @@ func (m *Manager) ExitsOf() ExitsView {
 		state := t.snapshot()
 		states[t] = state
 		if state.Status == "up" {
-			live[sanitizeTag(state.Node.HostName)] = true
+			live[tunnelBinding(t)] = true
 		}
 	}
 
 	byHost := map[string]int{}
 	for i, t := range tunnels {
 		state := states[t]
-		byHost[sanitizeTag(state.Node.HostName)] = i
+		byHost[tunnelBinding(t)] = i
 		cred := t.credential()
 		view.Exits = append(view.Exits, Exit{
 			Slot: state.Slot, Port: state.Port, Host: state.Node.HostName,

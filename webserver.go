@@ -49,7 +49,14 @@ func (s *webServer) reload(cfg WebSettings) error {
 	s.mu.Lock()
 	oldSrv := s.srv
 	oldLn := s.ln
-	srv := &http.Server{Handler: s.handler}
+	srv := &http.Server{
+		Handler:           s.handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      150 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 	s.srv = srv
 	s.ln = ln
 	s.addr = addr
@@ -77,8 +84,16 @@ func (s *webServer) reload(cfg WebSettings) error {
 	return nil
 }
 
-// applyWebSettings 校验、落盘并切换监听。任一步失败都不改动线上监听。
+// applyWebSettings 校验、落盘并切换监听。持久化失败时不会改变线上监听；
+// 新监听无法启动时会恢复原有设置文件。
 func (s *webServer) applyWebSettings(next WebSettings) error {
+	cur := getWebSettings()
+	// Callers that only change the Web listener may omit the unrelated inbound
+	// range; retain the loaded settings instead of treating zero values as a
+	// request for an invalid range.
+	if next.InboundPortMin == 0 && next.InboundPortMax == 0 {
+		next.InboundPortMin, next.InboundPortMax = cur.InboundPortMin, cur.InboundPortMax
+	}
 	if err := validatePort(next.Port); err != nil {
 		return err
 	}
@@ -87,22 +102,33 @@ func (s *webServer) applyWebSettings(next WebSettings) error {
 		return err
 	}
 	next.ListenAddr = norm
-
-	cur := getWebSettings()
-	// 端口和监听地址都没变就只需要确保已生效，避免无谓重绑
-	if next.Port == cur.Port && next.ListenAddr == cur.ListenAddr {
-		return nil
+	if err := validatePortRange(next.InboundPortMin, next.InboundPortMax); err != nil {
+		return err
 	}
 
-	if err := s.reload(next); err != nil {
-		return err
+	if next == cur {
+		return nil
 	}
 
 	webSettingsMu.Lock()
 	webSettingsCur = next
 	webSettingsMu.Unlock()
 	if err := saveWebSettings(); err != nil {
-		log.Printf("保存 Web 设置失败: %v", err)
+		webSettingsMu.Lock()
+		webSettingsCur = cur
+		webSettingsMu.Unlock()
+		return err
+	}
+	if next.Port == cur.Port && next.ListenAddr == cur.ListenAddr {
+		return nil
+	}
+	if err := s.reload(next); err != nil {
+		webSettingsMu.Lock()
+		webSettingsCur = cur
+		webSettingsMu.Unlock()
+		if restoreErr := saveWebSettings(); restoreErr != nil {
+			return fmt.Errorf("应用监听设置失败: %w；恢复设置文件失败: %v", err, restoreErr)
+		}
 		return err
 	}
 	return nil

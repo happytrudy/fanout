@@ -290,12 +290,43 @@ func (p *singBoxProc) reapOrphan() {
 		_ = os.Remove(p.pidPath())
 		return
 	}
-	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil && sameExecutable(exe, p.bin) {
+	exe, exeErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if exeErr == nil && sameExecutable(exe, p.bin) && p.ownsPID(pid) {
 		if proc, err := os.FindProcess(pid); err == nil {
 			_ = proc.Signal(syscall.SIGTERM)
+			if !waitPIDExit(pid, 3*time.Second) {
+				_ = proc.Signal(syscall.SIGKILL)
+				_ = waitPIDExit(pid, time.Second)
+			}
 		}
 	}
 	_ = os.Remove(p.pidPath())
+}
+
+func (p *singBoxProc) ownsPID(pid int) bool {
+	blob, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(string(blob), "\x00")
+	want := filepath.Join(p.dir, p.name+".json")
+	for i := 0; i+1 < len(args); i++ {
+		if (args[i] == "-c" || args[i] == "--config") && args[i+1] == want {
+			return true
+		}
+	}
+	return false
+}
+
+func waitPIDExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return syscall.Kill(pid, 0) != nil
 }
 
 func sameExecutable(a, b string) bool {

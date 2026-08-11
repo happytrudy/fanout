@@ -99,13 +99,19 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 		m.mu.Unlock()
 		return nil, err
 	}
+	routeToken, err := randomToken(6)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	t := &Tunnel{
-		Slot:   slot,
-		Port:   port,
-		Node:   node,
-		Status: "starting",
-		Since:  time.Now(),
-		Cred:   cred,
+		Slot:    slot,
+		RouteID: "exit-" + routeToken,
+		Port:    port,
+		Node:    node,
+		Status:  "starting",
+		Since:   time.Now(),
+		Cred:    cred,
 	}
 	m.tunnels[slot] = t
 	m.mu.Unlock()
@@ -230,11 +236,6 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	if err := t.startSingBox(m.singBoxBin, m.workDir); err != nil {
 		return err
 	}
-	if !t.hasListener() {
-		if err := t.serve(); err != nil {
-			return err
-		}
-	}
 	ip, err := t.waitExitIP(40 * time.Second)
 	if err != nil {
 		return err
@@ -338,8 +339,7 @@ func (m *Manager) StopAll() {
 }
 
 // SetCred 改一条出口的 SOCKS5 凭据。cred 两个字段都为空表示随机重置。
-// The sing-box gateway carries the same SOCKS credential, so it must be
-// regenerated after a credential change.
+// 公网 SOCKS 由该出口自己的 sing-box 直接提供，因此只需要重启这一条隧道。
 func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	m.mu.RLock()
 	t, ok := m.tunnels[slot]
@@ -358,20 +358,23 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	if err := validateCred(cred); err != nil {
 		return SocksCred{}, err
 	}
-
-	t.setCredential(cred)
+	if !t.reconnectMu.TryLock() {
+		return SocksCred{}, fmt.Errorf("这个出口正在重连中，稍等一下")
+	}
+	defer t.reconnectMu.Unlock()
+	if t.snapshot().Status != "up" {
+		return SocksCred{}, fmt.Errorf("出口尚未就绪，当前状态为 %s", t.snapshot().Status)
+	}
+	if m.singBoxBin == "" {
+		return SocksCred{}, fmt.Errorf("sing-box 不可用")
+	}
+	if err := t.restartWithCredential(m.singBoxBin, m.workDir, cred); err != nil {
+		return SocksCred{}, err
+	}
 	if err := m.saveState(); err != nil {
 		log.Printf("保存状态失败: %v", err)
 	}
-	m.syncCred(t)
 	return cred, nil
-}
-
-// syncCred 把新凭据写进后端的 socks 出站。
-func (m *Manager) syncCred(t *Tunnel) {
-	if err := m.resync(t); err != nil {
-		log.Printf("同步 SOCKS5 凭据到节点链接后端失败: %v", err)
-	}
 }
 
 // Shutdown 停掉运行态但保留状态文件，让下次启动能恢复同样的隧道。
@@ -397,7 +400,7 @@ func (m *Manager) nodeInUse(host string, exceptSlot int) bool {
 func (m *Manager) rebind(oldHost string, t *Tunnel) error {
 	x, err := openPanel()
 	if err != nil {
-		return nil
+		return err
 	}
 	return x.Rebind(oldHost, t, m.Tunnels())
 }
@@ -406,9 +409,37 @@ func (m *Manager) rebind(oldHost string, t *Tunnel) error {
 func (m *Manager) resync(t *Tunnel) error {
 	x, err := openPanel()
 	if err != nil {
-		return nil
+		return err
 	}
 	return x.ResyncOutbound(t, m.Tunnels())
+}
+
+// syncAfterReconnect repairs the inbound routing after a successful reconnect.
+// A transient panel/configuration failure must not leave the recovered tunnel
+// permanently detached from its bound inbounds.
+func (m *Manager) syncAfterReconnect(t *Tunnel, oldHost string) {
+	delay := 2 * time.Second
+	for attempt := 1; attempt <= 6 && m.tunnelActive(t); attempt++ {
+		state := t.snapshot()
+		if state.Status != "up" {
+			return
+		}
+		var err error
+		if state.Node.HostName != oldHost {
+			err = m.rebind(oldHost, t)
+		} else {
+			err = m.resync(t)
+		}
+		if err == nil {
+			invalidateInbounds()
+			return
+		}
+		log.Printf("重连后同步入站失败（第 %d/6 次）: %v", attempt, err)
+		if attempt < 6 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
 }
 
 // notifyPanel 告诉后端隧道集合变了。

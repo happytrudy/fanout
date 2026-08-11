@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -21,6 +23,8 @@ type Native struct {
 	inboundPortMax int
 	store          *nativeStore
 	proc           *singBoxProc
+	configHash     [sha256.Size]byte
+	hasConfigHash  bool
 }
 
 func openNative(workDir string, listen ...string) (*Native, error) {
@@ -82,9 +86,22 @@ func (n *Native) Kind() string { return "native" }
 
 func (n *Native) Describe() string { return "fanout 自建 sing-box (>=1.14)" }
 
-// apply 重新生成配置并重启 sing-box，然后落盘。
+// apply 重新生成配置并在内容确实变化时重启 sing-box，然后落盘。
 // 调用方必须已持有 n.mu。
 func (n *Native) apply(tunnels []*Tunnel) error {
+	// Upgrade hostname-based bindings from earlier releases. Route IDs stay
+	// stable across VPN Gate node swaps and avoid rewriting gateway routes.
+	legacy := make(map[string]string, len(tunnels))
+	for _, t := range tunnels {
+		state := t.snapshot()
+		legacy[sanitizeTag(state.Node.HostName)] = tunnelBinding(t)
+	}
+	for _, ib := range n.store.Inbounds {
+		if replacement, ok := legacy[ib.BoundTo]; ok {
+			ib.BoundTo = replacement
+		}
+	}
+
 	// Listen address is a runtime setting, not part of each client record.
 	// Render shallow copies so changing -inbound-listen also affects old entries.
 	list := n.store.sorted()
@@ -95,6 +112,15 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 		render = append(render, &copy)
 	}
 	cfg := buildSingBoxGatewayConfig(render, tunnels)
+	configBlob, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(configBlob)
+	hasInbounds := len(cfg["inbounds"].([]any)) > 0
+	if n.hasConfigHash && n.configHash == hash && (!hasInbounds || !n.proc.exited()) {
+		return n.store.save(n.dir)
+	}
 	path, err := writeSingBoxConfig(n.proc.dir, n.proc.name, cfg)
 	if err != nil {
 		return err
@@ -103,14 +129,33 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 		return err
 	}
 	// 没有入站时不必留着进程占资源
-	if len(cfg["inbounds"].([]any)) == 0 {
+	if !hasInbounds {
 		n.proc.stop()
+		n.configHash, n.hasConfigHash = hash, true
 		return n.store.save(n.dir)
 	}
 	if err := n.proc.start(path); err != nil {
 		return err
 	}
+	n.configHash, n.hasConfigHash = hash, true
 	return n.store.save(n.dir)
+}
+
+// commitMutation applies a changed store. If sing-box rejects or cannot start
+// the new configuration, restore both the in-memory store and the last known
+// good runtime configuration.
+// The caller must hold n.mu.
+func (n *Native) commitMutation(before *nativeStore, tunnels []*Tunnel) error {
+	if err := n.apply(tunnels); err == nil {
+		return nil
+	} else {
+		applyErr := err
+		n.store = before
+		if rollbackErr := n.apply(tunnels); rollbackErr != nil {
+			return fmt.Errorf("应用新配置失败: %w；恢复旧配置也失败: %v", applyErr, rollbackErr)
+		}
+		return applyErr
+	}
 }
 
 // OnTunnelsChanged 在隧道集合变化后重建配置。自建模式下出站直接由隧道列表
@@ -232,12 +277,13 @@ func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) err
 		return fmt.Errorf("入站 %s 不存在", inboundTag)
 	}
 
+	before := n.store.clone()
 	if target == nil {
 		found.BoundTo = ""
 	} else {
-		found.BoundTo = sanitizeTag(target.snapshot().Node.HostName)
+		found.BoundTo = tunnelBinding(target)
 	}
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 func (n *Native) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error {
@@ -245,17 +291,18 @@ func (n *Native) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error
 	defer n.mu.Unlock()
 
 	oldTag := sanitizeTag(oldHost)
-	newTag := sanitizeTag(target.snapshot().Node.HostName)
+	newTag := tunnelBinding(target)
 	newLabel := exitLabel(target)
+	before := n.store.clone()
 	for _, ib := range n.store.Inbounds {
-		if ib.BoundTo != oldTag {
+		if ib.BoundTo != oldTag && ib.BoundTo != newTag {
 			continue
 		}
 		ib.BoundTo = newTag
 		// 备注里带着旧出口的地区和 IP 尾段，换了节点要跟着改
 		ib.Remark = renameExitSuffix(ib.Remark, newLabel)
 	}
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 func (n *Native) ResyncOutbound(t *Tunnel, tunnels []*Tunnel) error {
@@ -283,6 +330,7 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 
 	used := n.store.usedPorts(tpl.netOrTCP())
 	created := []int{}
+	before := n.store.clone()
 	for _, host := range hosts {
 		t := byHost[host]
 		if t == nil || t.snapshot().Status != "up" {
@@ -290,7 +338,8 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 		}
 		port, err := freeRandomInboundPort(used, n.inboundPortMin, n.inboundPortMax, tpl.netOrTCP())
 		if err != nil {
-			return created, err
+			n.store = before
+			return nil, err
 		}
 		used[port] = true
 
@@ -309,7 +358,7 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 			Remark:   cloneRemark(tpl.Remark, exitLabel(t)),
 			Enable:   true,
 			Clients:  append([]nativeClient(nil), tpl.Clients...),
-			BoundTo:  sanitizeTag(t.snapshot().Node.HostName),
+			BoundTo:  tunnelBinding(t),
 		}
 		n.store.NextID++
 		n.store.Inbounds = append(n.store.Inbounds, clone)
@@ -319,8 +368,8 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 	if len(created) == 0 {
 		return created, fmt.Errorf("没有可用的隧道")
 	}
-	if err := n.apply(tunnels); err != nil {
-		return created, err
+	if err := n.commitMutation(before, tunnels); err != nil {
+		return nil, err
 	}
 	return created, nil
 }
@@ -329,6 +378,7 @@ func (n *Native) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	before := n.store.clone()
 	drop := map[int]bool{}
 	for _, id := range ids {
 		drop[id] = true
@@ -340,7 +390,7 @@ func (n *Native) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 		}
 	}
 	n.store.Inbounds = kept
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 // UpdateInbound 改端口、备注与启停。
@@ -356,15 +406,20 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 		return fmt.Errorf("入站 %d 不存在", id)
 	}
 
-	if patch.Port != nil && *patch.Port != ib.Port {
+	before := n.store.clone()
+	portChanged := patch.Port != nil && *patch.Port != ib.Port
+	if portChanged {
 		port := *patch.Port
 		if port < 1 || port > 65535 {
 			return fmt.Errorf("端口 %d 不在合法范围", port)
 		}
 		for _, other := range n.store.Inbounds {
-			if other.ID != id && other.Port == port {
+			if other.ID != id && other.Port == port && other.netOrTCP() == ib.netOrTCP() {
 				return fmt.Errorf("端口 %d 已被入站 %q 占用", port, other.Remark)
 			}
+		}
+		if !portAvailable(port, ib.netOrTCP()) {
+			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", port, ib.netOrTCP(), "IPv4+IPv6")
 		}
 		ib.Port = port
 	}
@@ -374,9 +429,12 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 		}
 	}
 	if patch.Enable != nil {
+		if *patch.Enable && !ib.Enable && !portChanged && !portAvailable(ib.Port, ib.netOrTCP()) {
+			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", ib.Port, ib.netOrTCP(), "IPv4+IPv6")
+		}
 		ib.Enable = *patch.Enable
 	}
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 // AddClient 给入站加一个客户端。同一入站上可以有多套凭据，便于分发给不同人。
@@ -399,6 +457,7 @@ func (n *Native) AddClient(id int, email string, tunnels []*Tunnel) error {
 		}
 	}
 
+	before := n.store.clone()
 	ib.Clients = append(ib.Clients, nativeClient{
 		Email:    email,
 		ID:       newUUID(),
@@ -406,7 +465,7 @@ func (n *Native) AddClient(id int, email string, tunnels []*Tunnel) error {
 		Enable:   true,
 		Flow:     visionFlow(ib),
 	})
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 // DeleteClient 摘掉一个客户端。留下最后一个是有意的：
@@ -432,8 +491,9 @@ func (n *Native) DeleteClient(id int, email string, tunnels []*Tunnel) error {
 	if len(kept) == len(ib.Clients) {
 		return fmt.Errorf("客户端 %q 不存在", email)
 	}
+	before := n.store.clone()
 	ib.Clients = kept
-	return n.apply(tunnels)
+	return n.commitMutation(before, tunnels)
 }
 
 // ResetClient 换一套新凭据，旧链接立即失效。
@@ -447,9 +507,10 @@ func (n *Native) ResetClient(id int, email string, tunnels []*Tunnel) error {
 	}
 	for i := range ib.Clients {
 		if ib.Clients[i].Email == email {
+			before := n.store.clone()
 			ib.Clients[i].ID = newUUID()
 			ib.Clients[i].Password = randomHex(8)
-			return n.apply(tunnels)
+			return n.commitMutation(before, tunnels)
 		}
 	}
 	return fmt.Errorf("客户端 %q 不存在", email)
@@ -499,6 +560,7 @@ var nativeProtocols = map[string]bool{"vless": true, "vmess": true, "trojan": tr
 func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*CreatedInbound, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	before := n.store.clone()
 
 	requestedNetwork := strings.ToLower(strings.TrimSpace(spec.Network))
 	if requestedNetwork == "" {
@@ -553,11 +615,7 @@ func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*Created
 	n.store.NextID++
 	n.store.Inbounds = append(n.store.Inbounds, ib)
 
-	if err := n.apply(tunnels); err != nil {
-		// 起不来就别把坏入站留在库里
-		n.store.Inbounds = n.store.Inbounds[:len(n.store.Inbounds)-1]
-		n.store.NextID--
-		_ = n.apply(tunnels)
+	if err := n.commitMutation(before, tunnels); err != nil {
 		return nil, err
 	}
 	return &CreatedInbound{

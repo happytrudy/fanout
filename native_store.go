@@ -41,7 +41,8 @@ type nativeInbound struct {
 	Remark   string         `json:"remark"`
 	Enable   bool           `json:"enable"`
 	Clients  []nativeClient `json:"clients"`
-	// BoundTo 是绑定的节点主机名经 sanitizeTag 后的形式，空表示直连
+	// BoundTo 是持久化的出口 Route ID，空表示直连。
+	// 旧版本存的是 hostname 经 sanitizeTag 后的值，加载时自动迁移。
 	BoundTo string `json:"bound_to"`
 }
 
@@ -99,6 +100,26 @@ func (n *nativeInbound) securityOrNone() string {
 type nativeStore struct {
 	NextID   int              `json:"next_id"`
 	Inbounds []*nativeInbound `json:"inbounds"`
+}
+
+func (s *nativeStore) clone() *nativeStore {
+	copyStore := &nativeStore{NextID: s.NextID, Inbounds: make([]*nativeInbound, 0, len(s.Inbounds))}
+	for _, inbound := range s.Inbounds {
+		copyInbound := *inbound
+		copyInbound.Clients = append([]nativeClient(nil), inbound.Clients...)
+		if inbound.TLS != nil {
+			copyTLS := *inbound.TLS
+			copyInbound.TLS = &copyTLS
+		}
+		if inbound.Reality != nil {
+			copyReality := *inbound.Reality
+			copyReality.ServerNames = append([]string(nil), inbound.Reality.ServerNames...)
+			copyReality.ShortIDs = append([]string(nil), inbound.Reality.ShortIDs...)
+			copyInbound.Reality = &copyReality
+		}
+		copyStore.Inbounds = append(copyStore.Inbounds, &copyInbound)
+	}
+	return copyStore
 }
 
 func nativeStatePath(dir string) string { return filepath.Join(dir, "native.json") }

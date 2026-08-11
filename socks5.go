@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,9 +19,6 @@ import (
 const (
 	socksVer5     = 0x05
 	authNone      = 0x00
-	authUserPass  = 0x02
-	authNoAccept  = 0xff
-	authSubVer    = 0x01
 	cmdConnect    = 0x01
 	atypIPv4      = 0x01
 	atypDomain    = 0x03
@@ -34,180 +29,11 @@ const (
 	repCmdNotSupp = 0x07
 )
 
-// serveSocks 处理一条 SOCKS5 连接。dial 决定流量从哪条链路出去。
-// cred 为 nil 时不要求认证（内部调用路径不会走到，这里只是兜底）。
-func serveSocks(client net.Conn, cred *SocksCred, dial func(network, addr string) (net.Conn, error)) {
-	defer client.Close()
-	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
-
-	if err := socksHandshake(client, cred); err != nil {
-		return
-	}
-
-	addr, err := socksReadRequest(client)
-	if err != nil {
-		if errors.Is(err, errCmdNotSupported) {
-			socksReply(client, repCmdNotSupp)
-		} else {
-			socksReply(client, repGenFail)
-		}
-		return
-	}
-
-	remote, err := dial("tcp", addr)
-	if err != nil {
-		socksReply(client, repHostUnre)
-		return
-	}
-	defer remote.Close()
-
-	if err := socksReply(client, repSuccess); err != nil {
-		return
-	}
-
-	// 转发阶段不设整体超时，交给两端自然关闭
-	_ = client.SetDeadline(time.Time{})
-	_ = remote.SetDeadline(time.Time{})
-	relay(client, remote)
-}
-
-// socksHandshake 完成方法协商，需要认证时接着跑一轮 RFC1929。
-func socksHandshake(c net.Conn, cred *SocksCred) error {
-	head := make([]byte, 2)
-	if _, err := io.ReadFull(c, head); err != nil {
-		return err
-	}
-	if head[0] != socksVer5 {
-		return errors.New("不是 socks5")
-	}
-	methods := make([]byte, int(head[1]))
-	if _, err := io.ReadFull(c, methods); err != nil {
-		return err
-	}
-
-	if cred == nil || cred.User == "" {
-		_, err := c.Write([]byte{socksVer5, authNone})
-		return err
-	}
-
-	// 客户端没提用户名口令就直接拒绝，不退回无认证
-	if !bytes.ContainsRune(methods, rune(authUserPass)) {
-		_, _ = c.Write([]byte{socksVer5, authNoAccept})
-		return errors.New("客户端不支持用户名口令认证")
-	}
-	if _, err := c.Write([]byte{socksVer5, authUserPass}); err != nil {
-		return err
-	}
-	return socksAuth(c, cred)
-}
-
-// socksAuth 跑一轮 RFC1929 用户名/口令子协商。
-func socksAuth(c net.Conn, cred *SocksCred) error {
-	ver := make([]byte, 1)
-	if _, err := io.ReadFull(c, ver); err != nil {
-		return err
-	}
-	if ver[0] != authSubVer {
-		return errors.New("认证子协议版本不对")
-	}
-	user, err := readLenPrefixed(c)
-	if err != nil {
-		return err
-	}
-	pass, err := readLenPrefixed(c)
-	if err != nil {
-		return err
-	}
-
-	// 恒定时间比较，避免按字节比对泄漏口令长度与前缀
-	okUser := subtle.ConstantTimeCompare(user, []byte(cred.User)) == 1
-	okPass := subtle.ConstantTimeCompare(pass, []byte(cred.Pass)) == 1
-	if !okUser || !okPass {
-		_, _ = c.Write([]byte{authSubVer, 0x01})
-		return errors.New("用户名或口令不对")
-	}
-	_, err = c.Write([]byte{authSubVer, 0x00})
-	return err
-}
-
-// readLenPrefixed 读一个单字节长度前缀的字段。
-func readLenPrefixed(c net.Conn) ([]byte, error) {
-	l := make([]byte, 1)
-	if _, err := io.ReadFull(c, l); err != nil {
-		return nil, err
-	}
-	b := make([]byte, int(l[0]))
-	if _, err := io.ReadFull(c, b); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-var errCmdNotSupported = errors.New("仅支持 CONNECT")
-
 // errIPv6NotSupported 表示拒绝 IPv6 目标：隧道内只有 IPv4。
 var errIPv6NotSupported = errors.New("隧道内不支持 IPv6")
 
-func socksReadRequest(c net.Conn) (string, error) {
-	head := make([]byte, 4)
-	if _, err := io.ReadFull(c, head); err != nil {
-		return "", err
-	}
-	if head[1] != cmdConnect {
-		return "", errCmdNotSupported
-	}
-
-	var host string
-	switch head[3] {
-	case atypIPv4:
-		b := make([]byte, 4)
-		if _, err := io.ReadFull(c, b); err != nil {
-			return "", err
-		}
-		host = net.IP(b).String()
-	case atypIPv6:
-		// 隧道内没有 IPv6 路由，放行只会让这条连接绕开隧道
-		b := make([]byte, 16)
-		if _, err := io.ReadFull(c, b); err != nil {
-			return "", err
-		}
-		return "", errIPv6NotSupported
-	case atypDomain:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(c, l); err != nil {
-			return "", err
-		}
-		b := make([]byte, int(l[0]))
-		if _, err := io.ReadFull(c, b); err != nil {
-			return "", err
-		}
-		host = string(b)
-	default:
-		return "", fmt.Errorf("不支持的地址类型 %d", head[3])
-	}
-
-	pb := make([]byte, 2)
-	if _, err := io.ReadFull(c, pb); err != nil {
-		return "", err
-	}
-	return net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(pb)))), nil
-}
-
-func socksReply(c net.Conn, code byte) error {
-	_, err := c.Write([]byte{socksVer5, code, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0})
-	return err
-}
-
-func relay(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
-}
-
 // dialSOCKS5 opens one CONNECT stream through an unauthenticated local SOCKS5
-// listener. Tunnel-facing sing-box instances listen only on loopback; fanout's
-// public listener remains responsible for client authentication.
+// listener. Tunnel-facing sing-box instances listen only on loopback.
 func dialSOCKS5(proxyAddr, target string, timeout time.Duration) (net.Conn, error) {
 	c, err := net.DialTimeout("tcp", proxyAddr, timeout)
 	if err != nil {

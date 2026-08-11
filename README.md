@@ -17,11 +17,13 @@ fanout 统一由 sing-box 管理节点入站和 VPN Gate 出口，建站、改�
 
 每个出口启动一个独立的 sing-box 进程。进程内使用 `system: false` 的 OpenVPN
 endpoint 和 gVisor 用户态网络栈，不创建系统 TUN 接口，也不改宿主路由或防火墙。
-公网 SOCKS5 仍由 fanout 监听和鉴权，内部流量再交给该出口的 loopback SOCKS5。
-因此换节点或掉线重连只影响这一条出口。
+每个隧道进程同时监听公网 SOCKS5，并在 sing-box 内完成用户名和口令认证；它还保留一个
+仅限 `127.0.0.1` 的无认证 SOCKS5，供节点链接网关转发使用。因此公网 SOCKS 数据不经过
+fanout 进程，换节点、掉线重连或修改 SOCKS 凭据都只影响这一条出口。
 
 ```
-客户端 ──> fanout SOCKS5 :随机端口 ──> sing-box SOCKS5 (loopback) ──> OpenVPN endpoint ──> VPN Gate 节点
+客户端 ──> sing-box 公网 SOCKS5（认证）:随机端口 ──> OpenVPN endpoint ──> VPN Gate 节点
+节点链接网关 ──> sing-box loopback SOCKS5（仅本机） ──> OpenVPN endpoint
 ```
 
 ## 安装
@@ -29,7 +31,7 @@ endpoint 和 gVisor 用户态网络栈，不创建系统 TUN 接口，也不改�
 安装服务需要 root，运行时不依赖 netns、iptables 或 `/dev/net/tun`。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/fanout/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/happytrudy/fanout/main/install.sh)
 ```
 
 会自动下载对应架构的预编译二进制。也可以 clone 仓库后在源码目录运行同一个脚本，
@@ -77,7 +79,7 @@ IPv6 出口。若 VPS 本身没有 IPv6，纯 IPv6 目标仍需在服务器或�
 
 ```bash
 apk add bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/fanout/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/happytrudy/fanout/main/install.sh)
 ```
 
 装完敲 `f` 打开管理菜单：
@@ -173,7 +175,7 @@ f uninstall  # 卸载
 ## 已知限制
 
 - Hysteria2/TUIC 入站可以转发 TCP 和 UDP；出口通过每条隧道的 sing-box 内部 SOCKS
-  访问 OpenVPN。单独提供给用户的 fanout SOCKS5 端口仍只支持 TCP CONNECT。
+  访问 OpenVPN。公网 SOCKS5 同样由对应隧道的 sing-box 直接提供并强制用户名口令认证。
 - VPN Gate 是志愿者节点，有相当比例已下线或满员（`AUTH_FAILED`）。
   启动时连不上会自动顺着同地区候选往下试，最多 6 个。
 - 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套一层反代。

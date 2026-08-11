@@ -43,6 +43,23 @@ func currentBasePath() string {
 
 // setBasePath 校验并保存新的访问路径，立即生效。空串表示不加路径前缀。
 func setBasePath(raw string) (string, error) {
+	bp, err := validateBasePath(raw)
+	if err != nil {
+		return "", err
+	}
+	basePathMu.RLock()
+	dir := basePathDir
+	basePathMu.RUnlock()
+	if err := os.WriteFile(filepath.Join(dir, "basepath"), []byte(strings.TrimPrefix(bp, "/")+"\n"), 0600); err != nil {
+		return "", fmt.Errorf("写访问路径失败: %w", err)
+	}
+	basePathMu.Lock()
+	basePathCur = bp
+	basePathMu.Unlock()
+	return bp, nil
+}
+
+func validateBasePath(raw string) (string, error) {
 	bp := normalizeBasePath(raw)
 	if bp != "" {
 		// 用户手填的路径放宽到任意字母数字加 - _，不套用自动生成时刻意避开的
@@ -55,15 +72,6 @@ func setBasePath(raw string) (string, error) {
 			}
 		}
 	}
-	basePathMu.RLock()
-	dir := basePathDir
-	basePathMu.RUnlock()
-	if err := os.WriteFile(filepath.Join(dir, "basepath"), []byte(strings.TrimPrefix(bp, "/")+"\n"), 0600); err != nil {
-		return "", fmt.Errorf("写访问路径失败: %w", err)
-	}
-	basePathMu.Lock()
-	basePathCur = bp
-	basePathMu.Unlock()
 	return bp, nil
 }
 

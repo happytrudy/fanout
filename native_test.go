@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +79,72 @@ func TestBuildSingBoxConfigHasDirectFallback(t *testing.T) {
 		return
 	}
 	t.Fatal("没有找到 direct 出站")
+}
+
+func TestBuildSingBoxConfigUsesStableRouteID(t *testing.T) {
+	tunnel := &Tunnel{
+		Port: 1080, RouteID: "exit-fixed", Status: "up",
+		Node: Node{HostName: "jp-old"},
+	}
+	inbound := &nativeInbound{ID: 1, Port: 100, Protocol: "vless", Enable: true, BoundTo: "exit-fixed"}
+	for _, host := range []string{"jp-old", "jp-new"} {
+		tunnel.setNode(Node{HostName: host})
+		cfg := buildSingBoxGatewayConfig([]*nativeInbound{inbound}, []*Tunnel{tunnel})
+		out := cfg["outbounds"].([]any)[2].(map[string]any)
+		if got := out["tag"]; got != "fanout-exit-fixed" {
+			t.Fatalf("outbound tag = %v, want stable route ID", got)
+		}
+		rule := cfg["route"].(map[string]any)["rules"].([]any)[2].(map[string]any)
+		if got := rule["outbound"]; got != "fanout-exit-fixed" {
+			t.Fatalf("route outbound = %v, want stable route ID", got)
+		}
+	}
+}
+
+func TestBuildSingBoxConfigSkipsUnboundExit(t *testing.T) {
+	tunnel := &Tunnel{Port: 1080, RouteID: "exit-unused", Status: "up", Node: Node{HostName: "jp1"}}
+	cfg := buildSingBoxGatewayConfig([]*nativeInbound{{ID: 1, Port: 100, Protocol: "vless", Enable: true}}, []*Tunnel{tunnel})
+	for _, item := range cfg["outbounds"].([]any) {
+		if item.(map[string]any)["tag"] == "fanout-exit-unused" {
+			t.Fatal("未绑定出口不应触发 gateway 配置变更")
+		}
+	}
+}
+
+func TestUpdateInboundRejectsOccupiedPortWithoutMutation(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	occupied := ln.Addr().(*net.TCPAddr).Port
+	native := &Native{store: &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 20001, Protocol: "vless", Network: "tcp", Enable: true,
+	}}}}
+	if err := native.UpdateInbound(1, InboundPatch{Port: &occupied}, nil); err == nil {
+		t.Fatal("已占用端口应被拒绝")
+	}
+	if got := native.store.Inbounds[0].Port; got != 20001 {
+		t.Fatalf("端口检查失败后不应修改内存状态，got %d", got)
+	}
+}
+
+func TestNativeMutationRollsBackWhenApplyFails(t *testing.T) {
+	dir := t.TempDir()
+	native := &Native{
+		dir: dir,
+		store: &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+			ID: 1, Port: 20001, Protocol: "vless", Network: "tcp", Remark: "old", Enable: true,
+		}}},
+		proc: &singBoxProc{bin: "/bin/false", dir: dir, name: "gateway"},
+	}
+	remark := "new"
+	if err := native.UpdateInbound(1, InboundPatch{Remark: &remark}, nil); err == nil {
+		t.Fatal("伪造的 sing-box 校验失败应返回错误")
+	}
+	if got := native.store.Inbounds[0].Remark; got != "old" {
+		t.Fatalf("应用失败后应回滚备注，got %q", got)
+	}
 }
 
 func TestShareLinkPerProtocol(t *testing.T) {

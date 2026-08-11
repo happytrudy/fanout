@@ -329,18 +329,28 @@ func openVPNEndpoint(profile, tag string) (map[string]any, error) {
 	return endpoint, nil
 }
 
-func buildTunnelSingBoxConfig(profile string, port int) (map[string]any, error) {
+func buildTunnelSingBoxConfig(profile string, internalPort, publicPort int, cred SocksCred) (map[string]any, error) {
 	endpoint, err := openVPNEndpoint(profile, "vpn")
 	if err != nil {
 		return nil, err
 	}
+	if err := validateCred(cred); err != nil {
+		return nil, fmt.Errorf("公网 SOCKS5 凭据无效: %w", err)
+	}
 	return map[string]any{
 		"log":       map[string]any{"level": "info", "timestamp": true},
 		"endpoints": []any{endpoint},
-		"inbounds": []any{map[string]any{
-			"type": "socks", "tag": "internal-socks",
-			"listen": "127.0.0.1", "listen_port": port,
-		}},
+		"inbounds": []any{
+			map[string]any{
+				"type": "socks", "tag": "internal-socks",
+				"listen": "127.0.0.1", "listen_port": internalPort,
+			},
+			map[string]any{
+				"type": "socks", "tag": "public-socks",
+				"listen": "0.0.0.0", "listen_port": publicPort,
+				"users": []any{map[string]any{"username": cred.User, "password": cred.Pass}},
+			},
+		},
 		"outbounds": []any{map[string]any{"type": "direct", "tag": "direct"}},
 		"route": map[string]any{
 			// VPN Gate profiles and the userspace OpenVPN endpoint are IPv4-only.
@@ -349,7 +359,7 @@ func buildTunnelSingBoxConfig(profile string, port int) (map[string]any, error) 
 			"rules": []any{
 				map[string]any{"action": "resolve", "strategy": "ipv4_only"},
 				map[string]any{
-					"inbound": []string{"internal-socks"},
+					"inbound": []string{"internal-socks", "public-socks"},
 					"action":  "route", "outbound": "vpn",
 				},
 			},

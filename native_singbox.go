@@ -13,14 +13,18 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		state := t.snapshot()
 		states[t] = state
 		if state.Status == "up" {
-			live[sanitizeTag(state.Node.HostName)] = true
+			live[tunnelBinding(t)] = true
 		}
 	}
 
 	ins := make([]any, 0, len(inbounds))
+	bound := make(map[string]bool)
 	for _, inbound := range inbounds {
 		if inbound.Enable {
 			ins = append(ins, singBoxInboundJSON(inbound))
+			if inbound.BoundTo != "" {
+				bound[inbound.BoundTo] = true
+			}
 		}
 	}
 
@@ -30,11 +34,11 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 	}
 	for _, t := range tunnels {
 		state := states[t]
-		if state.Status != "up" {
+		if state.Status != "up" || !bound[tunnelBinding(t)] {
 			continue
 		}
-		// Use the tunnel process' loopback SOCKS. It supports UDP and routes
-		// through the OpenVPN endpoint; the public fanout SOCKS remains TCP-only.
+		// Use the tunnel process' loopback SOCKS. The authenticated public SOCKS
+		// listener is intentionally not part of the gateway data path.
 		serverPort := t.internalProxyPort()
 		internal := serverPort != 0
 		if serverPort == 0 {

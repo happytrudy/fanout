@@ -19,18 +19,19 @@ type SocksCred struct {
 }
 
 // Tunnel is one VPN Gate exit. Each tunnel owns an isolated sing-box process
-// with a userspace OpenVPN endpoint and a loopback-only SOCKS listener.
+// with a userspace OpenVPN endpoint, an authenticated public SOCKS listener,
+// and a loopback-only SOCKS listener for the gateway process.
 type Tunnel struct {
-	Slot   int       `json:"slot"`
-	Port   int       `json:"port"`
-	Node   Node      `json:"node"`
-	Status string    `json:"status"` // starting | up | failed | stopped
-	ExitIP string    `json:"exit_ip"`
-	Err    string    `json:"err,omitempty"`
-	Since  time.Time `json:"since"`
-	Cred   SocksCred `json:"cred"`
+	Slot    int       `json:"slot"`
+	RouteID string    `json:"-"`
+	Port    int       `json:"port"`
+	Node    Node      `json:"node"`
+	Status  string    `json:"status"` // starting | up | failed | stopped
+	ExitIP  string    `json:"exit_ip"`
+	Err     string    `json:"err,omitempty"`
+	Since   time.Time `json:"since"`
+	Cred    SocksCred `json:"cred"`
 
-	listener     net.Listener
 	endpointPort int
 	proc         *singBoxProc
 	mu           sync.Mutex
@@ -39,19 +40,20 @@ type Tunnel struct {
 }
 
 type tunnelSnapshot struct {
-	Slot   int       `json:"slot"`
-	Port   int       `json:"port"`
-	Node   Node      `json:"node"`
-	Status string    `json:"status"`
-	ExitIP string    `json:"exit_ip"`
-	Err    string    `json:"err,omitempty"`
-	Since  time.Time `json:"since"`
+	Slot    int       `json:"slot"`
+	RouteID string    `json:"-"`
+	Port    int       `json:"port"`
+	Node    Node      `json:"node"`
+	Status  string    `json:"status"`
+	ExitIP  string    `json:"exit_ip"`
+	Err     string    `json:"err,omitempty"`
+	Since   time.Time `json:"since"`
 }
 
 func (t *Tunnel) snapshot() tunnelSnapshot {
 	t.stateMu.RLock()
 	defer t.stateMu.RUnlock()
-	return tunnelSnapshot{Slot: t.Slot, Port: t.Port, Node: t.Node, Status: t.Status, ExitIP: t.ExitIP, Err: t.Err, Since: t.Since}
+	return tunnelSnapshot{Slot: t.Slot, RouteID: t.RouteID, Port: t.Port, Node: t.Node, Status: t.Status, ExitIP: t.ExitIP, Err: t.Err, Since: t.Since}
 }
 
 func (t *Tunnel) setStatus(status, errText string) {
@@ -104,7 +106,7 @@ func (t *Tunnel) startSingBox(bin, workDir string) error {
 	t.mu.Unlock()
 
 	state := t.snapshot()
-	cfg, err := buildTunnelSingBoxConfig(state.Node.Config, port)
+	cfg, err := buildTunnelSingBoxConfig(state.Node.Config, port, state.Port, t.credential())
 	if err != nil {
 		return fmt.Errorf("转换 VPN Gate 配置失败: %w", err)
 	}
@@ -142,12 +144,6 @@ func (t *Tunnel) internalProxyPort() int {
 	return t.endpointPort
 }
 
-func (t *Tunnel) hasListener() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.listener != nil
-}
-
 func (t *Tunnel) dial(network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" {
 		return nil, fmt.Errorf("只支持 TCP")
@@ -157,50 +153,6 @@ func (t *Tunnel) dial(network, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	return dialSOCKS5(proxyAddr, addr, 20*time.Second)
-}
-
-// serve keeps the public SOCKS5 socket in fanout so credentials can be changed
-// without restarting the OpenVPN endpoint.
-func (t *Tunnel) serve() error {
-	state := t.snapshot()
-	publicPort := state.Port
-	var ln net.Listener
-	var err error
-	for i := 0; i < 6; i++ {
-		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", publicPort))
-		if err == nil {
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	if err != nil {
-		port, perr := freeRandomPort(map[int]bool{publicPort: true})
-		if perr != nil {
-			return fmt.Errorf("监听 %d 失败且无备用端口: %w", publicPort, err)
-		}
-		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
-		if err != nil {
-			return fmt.Errorf("监听 %d 失败: %w", port, err)
-		}
-		t.stateMu.Lock()
-		t.Port = port
-		t.stateMu.Unlock()
-	}
-	t.mu.Lock()
-	t.listener = ln
-	t.mu.Unlock()
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			cred := t.credential()
-			go serveSocks(conn, &cred, t.dial)
-		}
-	}()
-	return nil
 }
 
 func (t *Tunnel) credential() SocksCred {
@@ -213,6 +165,24 @@ func (t *Tunnel) setCredential(c SocksCred) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Cred = c
+}
+
+// restartWithCredential restarts only this tunnel's sing-box process. The
+// gateway uses the separate unauthenticated loopback listener, so its process
+// and all other exits remain untouched. Restore the old configuration if the
+// replacement cannot start.
+func (t *Tunnel) restartWithCredential(bin, workDir string, next SocksCred) error {
+	previous := t.credential()
+	t.setCredential(next)
+	if err := t.startSingBox(bin, workDir); err == nil {
+		return nil
+	} else {
+		t.setCredential(previous)
+		if rollbackErr := t.startSingBox(bin, workDir); rollbackErr != nil {
+			return fmt.Errorf("重启出口以应用 SOCKS5 凭据失败: %w；恢复旧配置也失败: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("重启出口以应用 SOCKS5 凭据失败: %w", err)
+	}
 }
 
 func (t *Tunnel) probeExitIP(timeout time.Duration) (string, error) {
@@ -268,13 +238,6 @@ func (t *Tunnel) waitExitIP(timeout time.Duration) (string, error) {
 }
 
 func (t *Tunnel) stop() {
-	t.mu.Lock()
-	ln := t.listener
-	t.listener = nil
-	t.mu.Unlock()
 	t.setStatus("stopped", "")
-	if ln != nil {
-		_ = ln.Close()
-	}
 	t.stopEngine()
 }

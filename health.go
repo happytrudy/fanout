@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sync"
 	"time"
 )
 
@@ -9,7 +10,16 @@ const (
 	healthInterval = 10 * time.Second
 	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
 	healthTimeout  = 6 * time.Second
+	// VPN Gate 列表最多同时管理 20 条隧道。限制并发避免所有 endpoint
+	// 同时向 ipify 发起请求，同时让一轮健康检查不会被串行超时拖垮。
+	healthCheckWorkers = 8
 )
+
+type healthResult struct {
+	tunnel  *Tunnel
+	state   tunnelSnapshot
+	healthy bool
+}
 
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
 // VPN Gate 是志愿者节点，运行中掉线很常见。
@@ -17,12 +27,14 @@ func (m *Manager) WatchHealth() {
 	fails := map[int]int{}
 
 	for range time.Tick(healthInterval) {
-		for _, t := range m.Tunnels() {
-			state := t.snapshot()
-			if state.Status != "up" {
+		for _, result := range parallelHealthCheck(m.Tunnels(), healthCheckWorkers, m.tunnelHealthy) {
+			state := result.state
+			// 手动换节点或停止可能恰好发生在探测期间；旧结果不能驱动新状态重连。
+			current := result.tunnel.snapshot()
+			if current.Status != "up" || current.RouteID != state.RouteID || current.ExitIP != state.ExitIP {
 				continue
 			}
-			if m.tunnelHealthy(t) {
+			if result.healthy {
 				fails[state.Slot] = 0
 				continue
 			}
@@ -35,9 +47,52 @@ func (m *Manager) WatchHealth() {
 
 			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", state.Slot, state.Node.HostName)
 			fails[state.Slot] = 0
-			m.reconnect(t, state.Node.HostName, nil)
+			m.reconnect(result.tunnel, state.Node.HostName, nil)
 		}
 	}
+}
+
+func parallelHealthCheck(tunnels []*Tunnel, workers int, healthy func(*Tunnel) bool) []healthResult {
+	jobs := make(chan healthResult)
+	results := make(chan healthResult, len(tunnels))
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(tunnels) {
+		workers = len(tunnels)
+	}
+	if workers == 0 {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				job.healthy = healthy(job.tunnel)
+				results <- job
+			}
+		}()
+	}
+	go func() {
+		for _, tunnel := range tunnels {
+			state := tunnel.snapshot()
+			if state.Status == "up" {
+				jobs <- healthResult{tunnel: tunnel, state: state}
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	out := make([]healthResult, 0, len(tunnels))
+	for result := range results {
+		out = append(out, result)
+	}
+	return out
 }
 
 // tunnelHealthy 判断隧道是否还真的走在 VPN 上。
@@ -84,19 +139,7 @@ func (m *Manager) reconnect(t *Tunnel, oldHost string, replacement *Node) bool {
 		if state.Status != "up" {
 			return
 		}
-		// 出站 tag 跟着节点名走，换了节点就要把原来指向它的入站重新绑过去，
-		// 否则面板里的路由会指向一个已经不存在的出站。
-		if state.Node.HostName != oldHost {
-			if err := m.rebind(oldHost, t); err != nil {
-				log.Printf("重连后同步入站绑定失败: %v", err)
-			}
-			return
-		}
-		// 节点名没变也要重写一次出站：出口 IP 可能变了，
-		// 而且上一轮换节点时留下的绑定需要重新指回来。
-		if err := m.resync(t); err != nil {
-			log.Printf("重连后刷新 sing-box 出站失败: %v", err)
-		}
+		m.syncAfterReconnect(t, oldHost)
 	}()
 	return true
 }

@@ -89,15 +89,29 @@ func (a *Auth) check(pw string) bool {
 	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
 }
 
-// SetPassword 改访问口令并落盘。空口令拒绝，避免误改成无密码裸奔。
-// 改完不动已有会话：当前登录的浏览器不会被踢，新登录才用新口令。
-func (a *Auth) SetPassword(pw string) error {
+func validatePassword(pw string) error {
 	pw = strings.TrimSpace(pw)
 	if pw == "" {
 		return fmt.Errorf("口令不能为空")
 	}
 	if len(pw) < 4 {
 		return fmt.Errorf("口令至少 4 位")
+	}
+	return nil
+}
+
+func (a *Auth) currentPassword() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.password
+}
+
+// SetPassword 改访问口令并落盘。空口令拒绝，避免误改成无密码裸奔。
+// 改完不动已有会话：当前登录的浏览器不会被踢，新登录才用新口令。
+func (a *Auth) SetPassword(pw string) error {
+	pw = strings.TrimSpace(pw)
+	if err := validatePassword(pw); err != nil {
+		return err
 	}
 	path := filepath.Join(a.dir, "password")
 	tmp := path + ".tmp"
@@ -281,7 +295,7 @@ button{width:100%;margin-top:14px;background:#4a9eda;border:0;color:#0b0e12;
   <a href="https://t.me/+ft-zI76oovgwNmRh" target="_blank" rel="noopener">交流群</a>
   <a href="https://youtube.com/@joeyblog" target="_blank" rel="noopener">油管</a>
   <a href="https://joeyblog.net" target="_blank" rel="noopener">博客</a>
-  <a href="https://github.com/byJoey/fanout" target="_blank" rel="noopener">GitHub</a>
+  <a href="https://github.com/happytrudy/fanout" target="_blank" rel="noopener">GitHub</a>
 </div>
 <script>
 document.getElementById('f').onsubmit = async e => {
