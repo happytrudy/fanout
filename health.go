@@ -24,29 +24,47 @@ type healthResult struct {
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
 // VPN Gate 是志愿者节点，运行中掉线很常见。
 func (m *Manager) WatchHealth() {
-	fails := map[int]int{}
+	fails := map[string]int{}
+	for {
+		// Schedule the next round after this one completes. Under a widespread
+		// outage, the bounded worker pool can take longer than healthInterval;
+		// immediately running another round would only add load to dead exits.
+		time.Sleep(healthInterval)
+		tunnels := m.Tunnels()
+		active := make(map[string]bool, len(tunnels))
+		for _, tunnel := range tunnels {
+			state := tunnel.snapshot()
+			if state.Status == "up" {
+				active[tunnelBinding(tunnel)] = true
+			}
+		}
+		for key := range fails {
+			if !active[key] {
+				delete(fails, key)
+			}
+		}
 
-	for range time.Tick(healthInterval) {
-		for _, result := range parallelHealthCheck(m.Tunnels(), healthCheckWorkers, m.tunnelHealthy) {
+		for _, result := range parallelHealthCheck(tunnels, healthCheckWorkers, m.tunnelHealthy) {
 			state := result.state
 			// 手动换节点或停止可能恰好发生在探测期间；旧结果不能驱动新状态重连。
 			current := result.tunnel.snapshot()
 			if current.Status != "up" || current.RouteID != state.RouteID || current.ExitIP != state.ExitIP {
 				continue
 			}
+			key := tunnelBinding(result.tunnel)
 			if result.healthy {
-				fails[state.Slot] = 0
+				fails[key] = 0
 				continue
 			}
 
-			fails[state.Slot]++
-			if fails[state.Slot] < healthFailures {
-				log.Printf("隧道 %d (%s) 探测失败 %d 次", state.Slot, state.Node.HostName, fails[state.Slot])
+			fails[key]++
+			if fails[key] < healthFailures {
+				log.Printf("隧道 %d (%s) 探测失败 %d 次", state.Slot, state.Node.HostName, fails[key])
 				continue
 			}
 
 			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", state.Slot, state.Node.HostName)
-			fails[state.Slot] = 0
+			fails[key] = 0
 			m.reconnect(result.tunnel, state.Node.HostName, nil)
 		}
 	}

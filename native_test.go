@@ -129,6 +129,20 @@ func TestUpdateInboundRejectsOccupiedPortWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestUpdateInboundRejectsPendingTunnelSocksPort(t *testing.T) {
+	port := 24567
+	native := &Native{store: &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 20001, Protocol: "vless", Network: "tcp", Enable: true,
+	}}}}
+	tunnel := &Tunnel{Slot: 1, Port: port, Status: "starting"}
+	if err := native.UpdateInbound(1, InboundPatch{Port: &port}, []*Tunnel{tunnel}); err == nil {
+		t.Fatal("等待启动的公网 SOCKS5 端口应被入站拒绝")
+	}
+	if got := native.store.Inbounds[0].Port; got != 20001 {
+		t.Fatalf("端口冲突后不应修改入站，got %d", got)
+	}
+}
+
 func TestNativeMutationRollsBackWhenApplyFails(t *testing.T) {
 	dir := t.TempDir()
 	native := &Native{

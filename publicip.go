@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
+	"io"
 	"net"
-	"os/exec"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +22,14 @@ var (
 	publicIPOverride string    // 由 -ip / FANOUT_PUBLIC_IP 显式指定，优先级最高
 	publicIPCache    string    // 上一次探测成功的结果
 	publicIPAt       time.Time // 上次探测时间，用于 TTL
+	publicIPFailedAt time.Time
+	publicIPProbing  bool
 )
 
-const publicIPTTL = 30 * time.Minute
+const (
+	publicIPTTL        = 30 * time.Minute
+	publicIPFailureTTL = time.Minute
+)
 
 // setPublicIPOverride 记录用户显式指定的母机公网地址，空值表示不覆盖。
 func setPublicIPOverride(ip string) {
@@ -32,8 +39,8 @@ func setPublicIPOverride(ip string) {
 }
 
 // hostPublicIP 返回跑 fanout 这台母机的公网 IPv4。
-// 优先用显式覆盖值；否则用缓存（未过期）；再否则对外探测一次。
-// 探测不到就返回空串，由调用方决定兜底。
+// 优先用显式覆盖值；否则用缓存（未过期）。缓存失效时后台刷新，避免
+// 出口列表请求被外部探测卡住；失败也会短暂缓存，防止页面轮询重复探测。
 func hostPublicIP() string {
 	publicIPMu.Lock()
 	if publicIPOverride != "" {
@@ -46,32 +53,53 @@ func hostPublicIP() string {
 		publicIPMu.Unlock()
 		return ip
 	}
-	publicIPMu.Unlock()
-
-	ip := probePublicIP()
-	if ip == "" {
-		// 探测失败时退回上一次的结果，比直接空着强
-		publicIPMu.Lock()
-		ip = publicIPCache
+	if publicIPProbing || time.Since(publicIPFailedAt) < publicIPFailureTTL {
+		ip := publicIPCache
 		publicIPMu.Unlock()
 		return ip
 	}
+	publicIPProbing = true
+	publicIPMu.Unlock()
 
+	go refreshPublicIP()
+	return ""
+}
+
+func refreshPublicIP() {
+	ip := probePublicIP()
 	publicIPMu.Lock()
+	defer publicIPMu.Unlock()
+	publicIPProbing = false
+	if ip == "" {
+		publicIPFailedAt = time.Now()
+		return
+	}
 	publicIPCache = ip
 	publicIPAt = time.Now()
-	publicIPMu.Unlock()
-	return ip
+	publicIPFailedAt = time.Time{}
 }
 
 // probePublicIP 逐个问外部接口，拿到第一个合法的 IPv4 就返回。
 func probePublicIP() string {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
 	for _, url := range publicIPSources {
-		out, err := exec.Command("curl", "-4", "-s", "--max-time", "5", url).Output()
+		resp, err := client.Get(url)
 		if err != nil {
 			continue
 		}
-		ip := strings.TrimSpace(string(out))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
 		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() != nil {
 			return ip
 		}

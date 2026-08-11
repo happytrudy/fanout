@@ -18,6 +18,7 @@ type Manager struct {
 	singBoxBin string
 	maxSlots   int
 	jobs       JobStore
+	stateMu    sync.Mutex
 }
 
 func NewManager(maxSlots int, workDir string, binary ...string) *Manager {
@@ -79,6 +80,14 @@ func (m *Manager) freeSlot() (int, error) {
 // Start 为指定节点开一条隧道，返回分配到的本地端口。
 func (m *Manager) Start(node Node) (*Tunnel, error) {
 	m.mu.Lock()
+	if node.HostName != "" {
+		for _, existing := range m.tunnels {
+			if existing.snapshot().Node.HostName == node.HostName {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("节点 %s 已有运行中的出口", node.HostName)
+			}
+		}
+	}
 	slot, err := m.freeSlot()
 	if err != nil {
 		m.mu.Unlock()
@@ -105,13 +114,14 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 		return nil, err
 	}
 	t := &Tunnel{
-		Slot:    slot,
-		RouteID: "exit-" + routeToken,
-		Port:    port,
-		Node:    node,
-		Status:  "starting",
-		Since:   time.Now(),
-		Cred:    cred,
+		Slot:          slot,
+		RouteID:       "exit-" + routeToken,
+		Port:          port,
+		Node:          node,
+		Status:        "starting",
+		Since:         time.Now(),
+		Cred:          cred,
+		portMayChange: true,
 	}
 	m.tunnels[slot] = t
 	m.mu.Unlock()
@@ -149,10 +159,10 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 			return
 		}
 		// 隧道已被用户停掉或从管理器移除，别再重试
-		if !persist || !m.tunnelActive(t) {
-			if persist {
-				return
-			}
+		if !m.tunnelActive(t) {
+			return
+		}
+		if !persist {
 			t.setStatus("failed", t.snapshot().Err)
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
@@ -200,9 +210,15 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 
 		err := m.tryNode(t)
 		if err == nil {
+			if !m.tunnelActive(t) {
+				t.stopEngine()
+				return false
+			}
 			t.setStatus("up", "")
 			if serr := m.saveState(); serr != nil {
-				log.Printf("保存状态失败: %v", serr)
+				t.setStatus("failed", fmt.Sprintf("保存隧道状态失败: %v", serr))
+				t.stopEngine()
+				return false
 			}
 			if notify {
 				m.notifyPanel()
@@ -236,9 +252,16 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	if err := t.startSingBox(m.singBoxBin, m.workDir); err != nil {
 		return err
 	}
+	if !m.tunnelActive(t) {
+		t.stopEngine()
+		return fmt.Errorf("隧道已停止")
+	}
 	ip, err := t.waitExitIP(40 * time.Second)
 	if err != nil {
 		return err
+	}
+	if !m.tunnelActive(t) {
+		return fmt.Errorf("隧道已停止")
 	}
 	t.setExitIP(ip)
 	return nil
@@ -298,7 +321,7 @@ func (m *Manager) Stop(slot int) error {
 	}
 	t.stop()
 	if err := m.saveState(); err != nil {
-		log.Printf("保存状态失败: %v", err)
+		return fmt.Errorf("出口已停止，但保存状态失败: %w", err)
 	}
 	m.notifyPanel()
 	return nil
@@ -368,11 +391,15 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	if m.singBoxBin == "" {
 		return SocksCred{}, fmt.Errorf("sing-box 不可用")
 	}
+	previous := t.credential()
 	if err := t.restartWithCredential(m.singBoxBin, m.workDir, cred); err != nil {
 		return SocksCred{}, err
 	}
 	if err := m.saveState(); err != nil {
-		log.Printf("保存状态失败: %v", err)
+		if rollbackErr := t.restartWithCredential(m.singBoxBin, m.workDir, previous); rollbackErr != nil {
+			return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败: %w；恢复旧凭据也失败: %v", err, rollbackErr)
+		}
+		return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败，已恢复旧凭据: %w", err)
 	}
 	return cred, nil
 }

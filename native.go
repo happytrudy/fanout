@@ -329,6 +329,11 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 	}
 
 	used := n.store.usedPorts(tpl.netOrTCP())
+	if tpl.netOrTCP() == "tcp" {
+		for port := range tunnelTCPPorts(tunnels) {
+			used[port] = true
+		}
+	}
 	created := []int{}
 	before := n.store.clone()
 	for _, host := range hosts {
@@ -418,6 +423,9 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 				return fmt.Errorf("端口 %d 已被入站 %q 占用", port, other.Remark)
 			}
 		}
+		if ib.netOrTCP() == "tcp" && tunnelUsesTCPPort(tunnels, port) {
+			return fmt.Errorf("端口 %d 已预留给公网 SOCKS5 出口", port)
+		}
 		if !portAvailable(port, ib.netOrTCP()) {
 			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", port, ib.netOrTCP(), "IPv4+IPv6")
 		}
@@ -429,6 +437,9 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 		}
 	}
 	if patch.Enable != nil {
+		if *patch.Enable && ib.netOrTCP() == "tcp" && tunnelUsesTCPPort(tunnels, ib.Port) {
+			return fmt.Errorf("端口 %d 已预留给公网 SOCKS5 出口", ib.Port)
+		}
 		if *patch.Enable && !ib.Enable && !portChanged && !portAvailable(ib.Port, ib.netOrTCP()) {
 			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", ib.Port, ib.netOrTCP(), "IPv4+IPv6")
 		}
@@ -571,7 +582,13 @@ func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*Created
 			requestedNetwork = "tcp"
 		}
 	}
-	ns, err := normalizeInboundSpec(spec, n.store.usedPorts(requestedNetwork), n.inboundPortMin, n.inboundPortMax)
+	used := n.store.usedPorts(requestedNetwork)
+	if requestedNetwork == "tcp" {
+		for port := range tunnelTCPPorts(tunnels) {
+			used[port] = true
+		}
+	}
+	ns, err := normalizeInboundSpec(spec, used, n.inboundPortMin, n.inboundPortMax)
 	if err != nil {
 		return nil, err
 	}

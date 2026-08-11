@@ -32,11 +32,13 @@ type Tunnel struct {
 	Since   time.Time `json:"since"`
 	Cred    SocksCred `json:"cred"`
 
-	endpointPort int
-	proc         *singBoxProc
-	mu           sync.Mutex
-	stateMu      sync.RWMutex
-	reconnectMu  sync.Mutex
+	endpointPort  int
+	proc          *singBoxProc
+	mu            sync.Mutex
+	stateMu       sync.RWMutex
+	lifecycleMu   sync.Mutex
+	reconnectMu   sync.Mutex
+	portMayChange bool
 }
 
 type tunnelSnapshot struct {
@@ -58,6 +60,10 @@ func (t *Tunnel) snapshot() tunnelSnapshot {
 
 func (t *Tunnel) setStatus(status, errText string) {
 	t.stateMu.Lock()
+	if t.Status == "stopped" && status != "stopped" {
+		t.stateMu.Unlock()
+		return
+	}
 	t.Status, t.Err = status, errText
 	t.stateMu.Unlock()
 }
@@ -70,7 +76,17 @@ func (t *Tunnel) setNode(node Node) {
 
 func (t *Tunnel) setExitIP(ip string) {
 	t.stateMu.Lock()
+	if t.Status == "stopped" {
+		t.stateMu.Unlock()
+		return
+	}
 	t.ExitIP = ip
+	t.stateMu.Unlock()
+}
+
+func (t *Tunnel) setPublicPort(port int) {
+	t.stateMu.Lock()
+	t.Port = port
 	t.stateMu.Unlock()
 }
 
@@ -87,6 +103,18 @@ func freeLoopbackPort() (int, error) {
 }
 
 func (t *Tunnel) startSingBox(bin, workDir string) error {
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
+	return t.startSingBoxLocked(bin, workDir)
+}
+
+// startSingBoxLocked starts this tunnel while the lifecycle lock is held. A
+// Stop cannot pass this point until the newly started child is owned by proc,
+// which prevents an untracked child from surviving a concurrent stop.
+func (t *Tunnel) startSingBoxLocked(bin, workDir string) error {
+	if t.snapshot().Status == "stopped" {
+		return fmt.Errorf("隧道已停止")
+	}
 	t.mu.Lock()
 	if t.endpointPort == 0 {
 		port, err := freeLoopbackPort()
@@ -105,22 +133,58 @@ func (t *Tunnel) startSingBox(bin, workDir string) error {
 	proc := t.proc
 	t.mu.Unlock()
 
-	state := t.snapshot()
-	cfg, err := buildTunnelSingBoxConfig(state.Node.Config, port, state.Port, t.credential())
-	if err != nil {
-		return fmt.Errorf("转换 VPN Gate 配置失败: %w", err)
+	for attempts := 0; attempts < 3; attempts++ {
+		state := t.snapshot()
+		if state.Status == "stopped" {
+			return fmt.Errorf("隧道已停止")
+		}
+		// A freshly allocated public port may be claimed between allocation and
+		// the child start. Reassign only before the first successful start; a
+		// reconnect must preserve the client-facing port already distributed.
+		if proc.exited() && !portAvailable(state.Port, "tcp") {
+			t.mu.Lock()
+			mayChange := t.portMayChange
+			t.mu.Unlock()
+			if !mayChange {
+				return fmt.Errorf("公网 SOCKS5 端口 %d 已被占用", state.Port)
+			}
+			next, err := freeRandomPort(map[int]bool{state.Port: true})
+			if err != nil {
+				return fmt.Errorf("公网 SOCKS5 端口 %d 已被占用且无法分配备用端口: %w", state.Port, err)
+			}
+			t.setPublicPort(next)
+			continue
+		}
+
+		cfg, err := buildTunnelSingBoxConfig(state.Node.Config, port, state.Port, t.credential())
+		if err != nil {
+			return fmt.Errorf("转换 VPN Gate 配置失败: %w", err)
+		}
+		cfgPath, err := writeSingBoxConfig(proc.dir, proc.name, cfg)
+		if err != nil {
+			return fmt.Errorf("写 sing-box 隧道配置失败: %w", err)
+		}
+		if err := verifySingBoxConfig(bin, cfgPath); err != nil {
+			return err
+		}
+		if err := proc.start(cfgPath); err != nil {
+			return err
+		}
+		t.mu.Lock()
+		t.portMayChange = false
+		t.mu.Unlock()
+		return nil
 	}
-	cfgPath, err := writeSingBoxConfig(proc.dir, proc.name, cfg)
-	if err != nil {
-		return fmt.Errorf("写 sing-box 隧道配置失败: %w", err)
-	}
-	if err := verifySingBoxConfig(bin, cfgPath); err != nil {
-		return err
-	}
-	return proc.start(cfgPath)
+	return fmt.Errorf("无法分配可用的公网 SOCKS5 端口")
 }
 
 func (t *Tunnel) stopEngine() {
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
+	t.stopEngineLocked()
+}
+
+func (t *Tunnel) stopEngineLocked() {
 	t.mu.Lock()
 	proc := t.proc
 	t.mu.Unlock()
@@ -172,13 +236,18 @@ func (t *Tunnel) setCredential(c SocksCred) {
 // and all other exits remain untouched. Restore the old configuration if the
 // replacement cannot start.
 func (t *Tunnel) restartWithCredential(bin, workDir string, next SocksCred) error {
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
+	if t.snapshot().Status == "stopped" {
+		return fmt.Errorf("隧道已停止")
+	}
 	previous := t.credential()
 	t.setCredential(next)
-	if err := t.startSingBox(bin, workDir); err == nil {
+	if err := t.startSingBoxLocked(bin, workDir); err == nil {
 		return nil
 	} else {
 		t.setCredential(previous)
-		if rollbackErr := t.startSingBox(bin, workDir); rollbackErr != nil {
+		if rollbackErr := t.startSingBoxLocked(bin, workDir); rollbackErr != nil {
 			return fmt.Errorf("重启出口以应用 SOCKS5 凭据失败: %w；恢复旧配置也失败: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("重启出口以应用 SOCKS5 凭据失败: %w", err)
@@ -238,6 +307,8 @@ func (t *Tunnel) waitExitIP(timeout time.Duration) (string, error) {
 }
 
 func (t *Tunnel) stop() {
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
 	t.setStatus("stopped", "")
-	t.stopEngine()
+	t.stopEngineLocked()
 }

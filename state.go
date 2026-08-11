@@ -30,6 +30,9 @@ func statePath(dir string) string { return filepath.Join(dir, "state.json") }
 
 // saveState 把当前隧道写入磁盘，供重启后恢复。
 func (m *Manager) saveState() error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
 	var st persistedState
 	for _, t := range m.Tunnels() {
 		state := t.snapshot()
@@ -56,11 +59,37 @@ func (m *Manager) saveState() error {
 	if err != nil {
 		return err
 	}
-	tmp := statePath(m.workDir) + ".tmp"
-	if err := os.WriteFile(tmp, blob, 0600); err != nil {
+	path := statePath(m.workDir)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, statePath(m.workDir))
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(blob); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // restoreState 读回上次的隧道并逐条拉起。
@@ -86,7 +115,22 @@ func (m *Manager) restoreState() (int, error) {
 	}
 
 	restored := make([]*Tunnel, 0, len(st.Tunnels))
+	seenSlots := make(map[int]bool, len(st.Tunnels))
+	seenPorts := make(map[int]bool, len(st.Tunnels))
+	seenRouteIDs := make(map[string]bool, len(st.Tunnels))
 	for _, p := range st.Tunnels {
+		if p.Slot < 1 || p.Slot > m.maxSlots {
+			return 0, fmt.Errorf("状态文件中的槽位 %d 不在 1-%d 范围内", p.Slot, m.maxSlots)
+		}
+		if seenSlots[p.Slot] {
+			return 0, fmt.Errorf("状态文件中槽位 %d 重复", p.Slot)
+		}
+		if err := validatePort(p.Port); err != nil {
+			return 0, fmt.Errorf("状态文件中槽位 %d 的 SOCKS5 端口无效: %w", p.Slot, err)
+		}
+		if seenPorts[p.Port] {
+			return 0, fmt.Errorf("状态文件中 SOCKS5 端口 %d 重复", p.Port)
+		}
 		node, ok := known[p.HostName]
 		if !ok {
 			// 节点已从 VPN Gate 列表消失，用存盘的信息重建
@@ -114,17 +158,27 @@ func (m *Manager) restoreState() (int, error) {
 			}
 			routeID = "exit-" + token
 		}
+		if seenRouteIDs[routeID] {
+			return 0, fmt.Errorf("状态文件中出口路由标识 %q 重复", routeID)
+		}
+		if err := validateCred(cred); err != nil {
+			return 0, fmt.Errorf("状态文件中槽位 %d 的 SOCKS5 凭据无效: %w", p.Slot, err)
+		}
 		t := &Tunnel{
-			Slot:    p.Slot,
-			RouteID: routeID,
-			Port:    p.Port,
-			Node:    node,
-			Status:  "starting",
-			Cred:    cred,
+			Slot:          p.Slot,
+			RouteID:       routeID,
+			Port:          p.Port,
+			Node:          node,
+			Status:        "starting",
+			Cred:          cred,
+			portMayChange: false,
 		}
 		m.mu.Lock()
 		m.tunnels[p.Slot] = t
 		m.mu.Unlock()
+		seenSlots[p.Slot] = true
+		seenPorts[p.Port] = true
+		seenRouteIDs[routeID] = true
 		restored = append(restored, t)
 	}
 	// Legacy state files receive Route IDs during restore. Persist them before
