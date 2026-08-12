@@ -1,16 +1,35 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
+
+func newNativeForEmbeddedTest(t *testing.T, store *nativeStore) *Native {
+	t.Helper()
+	engine, err := newEmbeddedEngine()
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := &Native{
+		dir:            t.TempDir(),
+		listenAddr:     "127.0.0.1",
+		inboundPortMin: inboundPortMinDefault,
+		inboundPortMax: inboundPortMaxDefault,
+		store:          store,
+		engine:         engine,
+		configHash:     make(map[int][sha256.Size]byte),
+		runtimeError:   make(map[int]string),
+	}
+	t.Cleanup(native.Close)
+	return native
+}
 
 func TestNativeInboundTagStable(t *testing.T) {
 	cases := []struct {
@@ -162,17 +181,14 @@ func TestUpdateInboundRejectsPendingTunnelSocksPort(t *testing.T) {
 }
 
 func TestNativeMutationRollsBackWhenApplyFails(t *testing.T) {
-	dir := t.TempDir()
-	native := &Native{
-		dir: dir,
-		store: &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
-			ID: 1, Port: 20001, Protocol: "vless", Network: "tcp", Remark: "old", Enable: true,
-		}}},
-		proc: &singBoxProc{bin: "/bin/false", dir: dir, name: "gateway"},
-	}
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 20001, Protocol: "vless", Network: "tcp", Remark: "old", Enable: true,
+		Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}},
+	}}})
+	_ = native.engine.close()
 	remark := "new"
 	if err := native.UpdateInbound(1, InboundPatch{Remark: &remark}, nil); err == nil {
-		t.Fatal("伪造的 sing-box 校验失败应返回错误")
+		t.Fatal("已关闭的内嵌 Box 应拒绝修改")
 	}
 	if got := native.store.Inbounds[0].Remark; got != "old" {
 		t.Fatalf("应用失败后应回滚备注，got %q", got)
@@ -180,78 +196,44 @@ func TestNativeMutationRollsBackWhenApplyFails(t *testing.T) {
 }
 
 func TestNativeRestartsOnlyChangedInbound(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-sing-box")
-	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then exit 0; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
-	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	native := &Native{
-		dir: dir,
-		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
-			{ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
-			{ID: 2, Port: 24002, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
-		}},
-		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
-	}
-	defer native.Close()
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+		{ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
+		{ID: 2, Port: 24002, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
+	}})
 	if err := native.apply(nil); err != nil {
 		t.Fatal(err)
 	}
-	first := native.inboundProc(1)
-	second := native.inboundProc(2)
-	if first.exited() || second.exited() {
-		t.Fatal("两个入站都应有独立进程")
-	}
-	firstPID := first.cmd.Process.Pid
-	secondPID := second.cmd.Process.Pid
+	first := native.engine.inbounds[1]
+	second := native.engine.inbounds[2]
 	if err := native.AddClient(1, "new-client", nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := native.inboundProc(1).cmd.Process.Pid; got == firstPID {
-		t.Fatalf("修改入站 1 凭据后其进程未重启，pid=%d", got)
+	if got := native.engine.inbounds[1].hash; got == first.hash {
+		t.Fatal("修改入站 1 凭据后其监听器配置未更新")
 	}
-	if got := native.inboundProc(2).cmd.Process.Pid; got != secondPID {
-		t.Fatalf("修改入站 1 不应重启入站 2，got pid=%d want %d", got, secondPID)
-	}
-	path := filepath.Join(dir, "sing-box", "inbound-1.json")
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("缺少独立入站配置 %s: %v", path, err)
+	if got := native.engine.inbounds[2].hash; got != second.hash {
+		t.Fatal("修改入站 1 不应影响入站 2")
 	}
 }
 
 func TestNativeReconcilesExitedInboundWithoutRestartingPeers(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-sing-box")
-	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then exit 0; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
-	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	native := &Native{
-		dir: dir,
-		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
-			{ID: 1, Port: 24101, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
-			{ID: 2, Port: 24102, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
-		}},
-		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
-	}
-	defer native.Close()
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+		{ID: 1, Port: 24101, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
+		{ID: 2, Port: 24102, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
+	}})
 	if err := native.apply(nil); err != nil {
 		t.Fatal(err)
 	}
-	first := native.inboundProc(1)
-	second := native.inboundProc(2)
-	firstPID := first.cmd.Process.Pid
-	secondPID := second.cmd.Process.Pid
-	first.stop()
-	if err := native.reconcile(nil, false, nil); err != nil {
+	second := native.engine.inbounds[2]
+	port := 24103
+	if err := native.UpdateInbound(1, InboundPatch{Port: &port}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := native.inboundProc(1).cmd.Process.Pid; got == firstPID {
-		t.Fatalf("退出的入站 1 没有被重新拉起，pid=%d", got)
+	if !native.engine.hasInbound(1, "in-24103-tcp") {
+		t.Fatal("更新后的入站未在共享 Box 注册")
 	}
-	if got := native.inboundProc(2).cmd.Process.Pid; got != secondPID {
-		t.Fatalf("守护重启不应影响入站 2，got pid=%d want %d", got, secondPID)
+	if got := native.engine.inbounds[2].hash; got != second.hash {
+		t.Fatal("更新入站 1 不应重启入站 2")
 	}
 }
 
@@ -322,90 +304,64 @@ func TestUpdateInboundRejectsEnableWithoutClient(t *testing.T) {
 	}
 }
 
-func TestNativeRejectsEnableBeyondWorkerLimit(t *testing.T) {
-	inbounds := make([]*nativeInbound, 0, maxNativeInboundProcesses+1)
-	for id := 1; id <= maxNativeInboundProcesses; id++ {
+func TestNativeRejectsEnableBeyondInboundLimit(t *testing.T) {
+	inbounds := make([]*nativeInbound, 0, maxNativeInbounds+1)
+	for id := 1; id <= maxNativeInbounds; id++ {
 		inbounds = append(inbounds, &nativeInbound{ID: id, Port: 25000 + id, Enable: true})
 	}
-	inbounds = append(inbounds, &nativeInbound{ID: maxNativeInboundProcesses + 1, Port: 26000, Enable: false})
-	native := &Native{store: &nativeStore{NextID: maxNativeInboundProcesses + 2, Inbounds: inbounds}}
+	inbounds = append(inbounds, &nativeInbound{ID: maxNativeInbounds + 1, Port: 26000, Enable: false})
+	native := &Native{store: &nativeStore{NextID: maxNativeInbounds + 2, Inbounds: inbounds}}
 	enable := true
-	if err := native.UpdateInbound(maxNativeInboundProcesses+1, InboundPatch{Enable: &enable}, nil); err == nil {
-		t.Fatal("超过子进程上限时启用入站应被拒绝")
-	}
-}
-
-func TestNativeWatchRetryBackoff(t *testing.T) {
-	base := time.Unix(100, 0)
-	failure := nativeWatchFailure{count: 1, next: base.Add(nativeWatchInterval)}
-	if nativeRetryDue(failure, base.Add(nativeWatchInterval-time.Nanosecond)) {
-		t.Fatal("退避期限前不应重试")
-	}
-	if !nativeRetryDue(failure, base.Add(nativeWatchInterval)) {
-		t.Fatal("退避期限到达后应允许重试")
-	}
-	if got := nativeRetryDelay(5); got != nativeWatchBackoffMax {
-		t.Fatalf("退避上限 = %s, want %s", got, nativeWatchBackoffMax)
+	if err := native.UpdateInbound(maxNativeInbounds+1, InboundPatch{Enable: &enable}, nil); err == nil {
+		t.Fatal("超过入站上限时启用入站应被拒绝")
 	}
 }
 
 func TestNativeReconcileContinuesAfterInboundFailure(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-sing-box")
-	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then case \"$3\" in *inbound-1.json) exit 1;; *) exit 0;; esac; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
-	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		t.Fatal(err)
 	}
-	native := &Native{
-		dir: dir,
-		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
-			{ID: 1, Port: 24301, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "bad", ID: newUUID(), Enable: true}}},
-			{ID: 2, Port: 24302, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "good", ID: newUUID(), Enable: true}}},
-		}},
-		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
-	}
-	defer native.Close()
+	defer ln.Close()
+	badPort := ln.Addr().(*net.TCPAddr).Port
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+		{ID: 1, Port: badPort, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "bad", ID: newUUID(), Enable: true}}},
+		{ID: 2, Port: 24302, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "good", ID: newUUID(), Enable: true}}},
+	}})
 	if err := native.apply(nil); err == nil {
-		t.Fatal("第一个入站校验失败时应返回错误")
-	}
-	if native.inboundProc(1).exited() == false {
-		t.Fatal("失败入站不应启动")
-	}
-	if native.inboundProc(2).exited() {
-		t.Fatal("后续健康入站仍应完成启动")
+		t.Fatal("端口冲突入站应导致同步报错")
 	}
 	list, err := native.Inbounds(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := list[0].RuntimeStatus; got != "retrying" {
-		t.Fatalf("失败入站运行状态 = %q, want retrying", got)
+	byID := make(map[int]Inbound, len(list))
+	for _, inbound := range list {
+		byID[inbound.ID] = inbound
 	}
-	if list[0].RuntimeError == "" {
+	if got := byID[1].RuntimeStatus; got != "stopped" {
+		t.Fatalf("失败入站运行状态 = %q, want stopped", got)
+	}
+	if byID[1].RuntimeError == "" {
 		t.Fatal("失败入站应公开最近错误")
 	}
-	if list[0].RetryAt.IsZero() {
-		t.Fatal("失败入站应公开下次重试时间")
-	}
-	if got := list[1].RuntimeStatus; got != "running" {
+	if got := byID[2].RuntimeStatus; got != "running" {
 		t.Fatalf("健康入站运行状态 = %q, want running", got)
 	}
 }
 
-func TestNativeInboundRuntimeReportsChildExit(t *testing.T) {
-	native := &Native{
-		store: &nativeStore{Inbounds: []*nativeInbound{{ID: 1, Enable: true}}},
-		procs: map[int]*singBoxProc{1: {lastExitErr: errors.New("exit status 1"), lastExitAt: time.Now()}},
-	}
+func TestNativeInboundRuntimeReportsEmbeddedListenerError(t *testing.T) {
+	native := newNativeForEmbeddedTest(t, &nativeStore{Inbounds: []*nativeInbound{{ID: 1, Enable: true}}})
+	native.runtimeError[1] = "listen tcp: address already in use"
 	list, err := native.Inbounds(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := list[0].RuntimeStatus; got != "retrying" {
-		t.Fatalf("异常退出入站运行状态 = %q, want retrying", got)
+	if got := list[0].RuntimeStatus; got != "stopped" {
+		t.Fatalf("监听失败入站运行状态 = %q, want stopped", got)
 	}
-	if !strings.Contains(list[0].RuntimeError, "exit status 1") {
-		t.Fatalf("异常退出错误 = %q", list[0].RuntimeError)
+	if !strings.Contains(list[0].RuntimeError, "address already in use") {
+		t.Fatalf("监听错误 = %q", list[0].RuntimeError)
 	}
 	detail, err := native.InboundDetail(1, "127.0.0.1")
 	if err != nil {
@@ -417,21 +373,16 @@ func TestNativeInboundRuntimeReportsChildExit(t *testing.T) {
 }
 
 func TestNativeMutationSurvivesUnrelatedBrokenInbound(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-sing-box")
-	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then case \"$3\" in *inbound-1.json) exit 1;; *) exit 0;; esac; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
-	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		t.Fatal(err)
 	}
-	native := &Native{
-		dir: dir,
-		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
-			{ID: 1, Port: 24401, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "broken", ID: newUUID(), Enable: true}}},
-			{ID: 2, Port: 24402, Protocol: "vless", Network: "tcp", Enable: true, Remark: "old", Clients: []nativeClient{{Email: "healthy", ID: newUUID(), Enable: true}}},
-		}},
-		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
-	}
-	defer native.Close()
+	defer ln.Close()
+	badPort := ln.Addr().(*net.TCPAddr).Port
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+		{ID: 1, Port: badPort, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "broken", ID: newUUID(), Enable: true}}},
+		{ID: 2, Port: 24402, Protocol: "vless", Network: "tcp", Enable: true, Remark: "old", Clients: []nativeClient{{Email: "healthy", ID: newUUID(), Enable: true}}},
+	}})
 	if err := native.apply(nil); err == nil {
 		t.Fatal("初始坏入站应导致同步报错")
 	}

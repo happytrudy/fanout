@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fanout 安装脚本：装 fanout + sing-box、装服务（systemd 或 OpenRC）、开机自启。
+# fanout 安装脚本：装内嵌 sing-box 的 fanout、装服务（systemd 或 OpenRC）、开机自启。
 #
 # Alpine 默认不带 bash，先装再跑：
 #   apk add bash && bash <(curl -fsSL .../install.sh)
@@ -74,7 +74,7 @@ svc_logs_hint() {
   [[ "$INIT_SYS" == systemd ]] && echo "journalctl -u fanout -n 30" || echo "cat /var/log/fanout.log"
 }
 
-echo "[1/5] 检查依赖"
+echo "[1/4] 检查依赖"
 
 # 同一个命令在各发行版里的包名并不一致，按包管理器分别给出。
 pkg_for() {
@@ -128,7 +128,7 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
   }
 fi
 
-echo "[2/5] 获取程序"
+echo "[2/4] 获取程序"
 REPO="${REPO:-happytrudy/fanout}"
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -139,7 +139,17 @@ esac
 
 if [[ -f main.go ]] && command -v go >/dev/null; then
   echo "      从源码编译"
-  CGO_ENABLED=0 go build -trimpath -tags "netgo osusergo" -ldflags "-s -w" -o "$BIN" .
+  GO_VERSION=$(go env GOVERSION | sed 's/^go//')
+  IFS=. read -r GO_MAJOR GO_MINOR GO_PATCH <<<"$GO_VERSION"
+  [[ "$GO_MAJOR" =~ ^[0-9]+$ && "$GO_MINOR" =~ ^[0-9]+$ && "$GO_PATCH" =~ ^[0-9]+$ ]] || {
+    echo "      无法识别 Go 版本: ${GO_VERSION}" >&2
+    exit 1
+  }
+  (( GO_MAJOR > 1 || (GO_MAJOR == 1 && (GO_MINOR > 25 || (GO_MINOR == 25 && GO_PATCH >= 5)))) ) || {
+    echo "      源码编译需要 Go 1.25.5+，当前为 ${GO_VERSION}" >&2
+    exit 1
+  }
+  CGO_ENABLED=0 go build -trimpath -tags "netgo osusergo with_gvisor with_quic" -ldflags "-s -w" -o "$BIN" .
 else
   echo "      下载预编译版本 (${GOARCH})"
   TMP=$(mktemp -d)
@@ -156,62 +166,7 @@ else
   rm -rf "$TMP"
 fi
 
-SINGBOX_VERSION="${SINGBOX_VERSION:-latest}"
-if [[ "$SINGBOX_VERSION" == "latest" ]]; then
-  SINGBOX_TAG_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
-    https://github.com/SagerNet/sing-box/releases/latest || true)
-  SINGBOX_VERSION=${SINGBOX_TAG_URL##*/}
-  SINGBOX_VERSION=${SINGBOX_VERSION#v}
-fi
-[[ "$SINGBOX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || {
-  echo "      无法确定 sing-box 版本，请设置 SINGBOX_VERSION，例如 1.14.0-alpha.50" >&2
-  exit 1
-}
-echo "[3/5] 准备 sing-box ${SINGBOX_VERSION}（运行时要求 >= 1.14）"
-mkdir -p "${WORK_DIR}/bin"
-CURRENT_SINGBOX=""
-if [[ -x "${WORK_DIR}/bin/sing-box" ]]; then
-  CURRENT_SINGBOX=$("${WORK_DIR}/bin/sing-box" version 2>/dev/null | head -1 || true)
-fi
-CURRENT_VERSION=$(sed -n 's/^sing-box version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' <<<"$CURRENT_SINGBOX")
-if [[ "$CURRENT_VERSION" =~ ^1\.(1[4-9]|[2-9][0-9])$ || "$CURRENT_VERSION" =~ ^[2-9][0-9]*\. ]] && \
-   [[ "$CURRENT_SINGBOX" == *with_openvpn* && "$CURRENT_SINGBOX" == *with_gvisor* ]]; then
-  echo "      已有 ${CURRENT_SINGBOX}"
-else
-  echo "      下载 sing-box"
-  ST=$(mktemp -d)
-  SINGBOX_ASSET="sing-box-${SINGBOX_VERSION}-linux-${GOARCH}.tar.gz"
-  SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${SINGBOX_ASSET}"
-  if ! curl -fsSL "$SINGBOX_URL" -o "$ST/sing-box.tar.gz"; then
-    echo "      下载失败: $SINGBOX_URL" >&2
-    exit 1
-  fi
-  case "$GOARCH" in
-    amd64) SINGBOX_SHA256=b2af50118c457e13e9e6deeb1ee07e609d8862deb2568ea267b941e594234ca8 ;;
-    arm64) SINGBOX_SHA256=18216accfbe05482fff35af4b5fa5f2b8c6a655c9675f6482e3846da34ca18db ;;
-  esac
-  if [[ -n "${SINGBOX_SHA256:-}" ]] && command -v sha256sum >/dev/null 2>&1; then
-    SINGBOX_ACTUAL=$(sha256sum "$ST/sing-box.tar.gz")
-    SINGBOX_ACTUAL=${SINGBOX_ACTUAL%% *}
-    [[ "$SINGBOX_ACTUAL" == "$SINGBOX_SHA256" ]] || {
-      echo "      sing-box 压缩包校验失败" >&2
-      exit 1
-    }
-  fi
-  tar xzf "$ST/sing-box.tar.gz" -C "$ST"
-  SB_BIN=$(find "$ST" -type f -name sing-box -perm -u+x | head -1)
-  [[ -n "$SB_BIN" ]] || { echo "      sing-box 解压失败" >&2; exit 1; }
-  install -m 755 "$SB_BIN" "${WORK_DIR}/bin/sing-box"
-  echo "      $("${WORK_DIR}/bin/sing-box" version 2>/dev/null | head -1)"
-  rm -rf "$ST"
-fi
-SINGBOX_INFO=$("${WORK_DIR}/bin/sing-box" version 2>/dev/null)
-[[ "$SINGBOX_INFO" == *with_openvpn* && "$SINGBOX_INFO" == *with_gvisor* ]] || {
-  echo "      sing-box 缺少 with_openvpn 或 with_gvisor 构建标签" >&2
-  exit 1
-}
-
-echo "[4/5] 安装服务"
+echo "[3/4] 安装服务"
 # 管理菜单
 if [[ -f f.sh ]]; then
   install -m 755 f.sh /usr/local/bin/f
@@ -226,7 +181,7 @@ chmod 700 "$WORK_DIR"
 svc_install
 svc_enable_start
 
-echo "[5/5] 就绪"
+echo "[4/4] 就绪"
 sleep 3
 svc_is_active && echo "      服务运行中（${INIT_SYS}）" || {
   echo "      服务启动失败，看 $(svc_logs_hint)" >&2

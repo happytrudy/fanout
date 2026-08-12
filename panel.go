@@ -24,7 +24,7 @@ type Panel interface {
 	CloneToTunnels(templateID int, hosts []string, tunnels []*Tunnel) ([]int, error)
 	DeleteInbounds(ids []int, tunnels []*Tunnel) error
 
-	// CreateInbound creates an inbound and starts its isolated sing-box worker.
+	// CreateInbound registers an inbound in the shared embedded sing-box.
 	CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*CreatedInbound, error)
 
 	// UpdateInbound 改端口、备注与启停。只有非零/非 nil 的字段会被写入。
@@ -37,12 +37,12 @@ type Panel interface {
 	// ResetClient 换掉客户端的凭据（UUID / trojan 密码），已分发的旧链接随即失效。
 	ResetClient(id int, email string, tunnels []*Tunnel) error
 
-	// OnTunnelsChanged refreshes only workers whose route configuration changed.
+	// OnTunnelsChanged refreshes routes whose bound exit changed.
 	OnTunnelsChanged(tunnels []*Tunnel) error
 	// SetInboundPortRange changes the range used for future random inbounds.
 	SetInboundPortRange(min, max int) error
 
-	// Close releases all inbound sing-box workers.
+	// Close releases the shared embedded sing-box.
 	Close()
 }
 

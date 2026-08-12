@@ -45,7 +45,7 @@ func main() {
 		maxSlots      = flag.Int("max", 20, "最多同时运行的隧道数")
 		workDir       = flag.String("dir", "/var/lib/fanout", "工作目录")
 		inboundListen = flag.String("inbound-listen", "0.0.0.0", "自建节点监听地址；使用 :: 接收 IPv6/双栈连接")
-		singBoxName   = flag.String("bin", "sing-box", "sing-box 二进制文件名（位于工作目录/bin，不支持路径）")
+		singBoxName   = flag.String("bin", "sing-box", "已废弃：内嵌 sing-box 不使用外部二进制")
 	)
 	publicIP := flag.String("ip", "", "母机公网 IPv4，用于分享链接/SOCKS5 地址；留空则自动探测")
 	showVersion := flag.Bool("version", false, "显示版本后退出")
@@ -65,29 +65,22 @@ func main() {
 	}
 	setPublicIPOverride(*publicIP)
 	go hostPublicIP() // 预热探测，别让首个请求阻塞
-	singBoxBin, err := findSingBox(*workDir, *singBoxName)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := validateSingBox(singBoxBin); err != nil {
-		log.Fatal(err)
-	}
-
 	webCfg, err := loadWebSettings(*workDir, *webPort)
 	if err != nil {
 		log.Fatalf("加载 Web 设置失败: %v", err)
 	}
 	configurePanelWithListenRangeAndBin(*workDir, *inboundListen, webCfg.InboundPortMin, webCfg.InboundPortMax, *singBoxName)
-	if p, err := openPanel(); err != nil {
-		log.Printf("节点链接后端暂不可用（可在 Web 界面查看原因）: %v", err)
+	panel, panelErr := openPanel()
+	if panelErr != nil {
+		log.Printf("节点链接后端暂不可用（可在 Web 界面查看原因）: %v", panelErr)
 	} else {
-		log.Printf("节点链接后端: %s", p.Describe())
+		log.Printf("节点链接后端: %s", panel.Describe())
 	}
 
 	mgr := NewManager(*maxSlots, *workDir)
-	// findSingBox above already resolved the configured filename to a concrete
-	// executable path; pass that path to tunnel workers directly.
-	mgr.singBoxBin = singBoxBin
+	if native, ok := panel.(*Native); ok {
+		mgr.engine = native.embeddedEngine()
+	}
 	log.Printf("正在拉取节点列表...")
 	if n, err := mgr.RefreshNodes(); err != nil {
 		log.Printf("拉取失败（可在 Web 界面重试）: %v", err)

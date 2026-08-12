@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,44 @@ import (
 	"testing"
 	"time"
 )
+
+func TestEmbeddedTunnelReassignsOnlyPendingOccupiedPort(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	occupied := listener.Addr().(*net.TCPAddr).Port
+
+	engine, err := newEmbeddedEngine()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.close()
+	if err := engine.close(); err != nil {
+		t.Fatal(err)
+	}
+	tunnel := &Tunnel{
+		Slot: 1, Port: occupied, Status: "starting", portMayChange: true,
+		Node: Node{Config: testVPNGateProfile}, Cred: SocksCred{User: "user", Pass: "password"},
+	}
+	tunnel.setEngine(engine)
+	if err := tunnel.startSingBox("", t.TempDir()); err == nil {
+		t.Fatal("已关闭的引擎不应启动隧道")
+	}
+	if got := tunnel.snapshot().Port; got == occupied {
+		t.Fatalf("初始 SOCKS5 端口被占用时应重新分配，仍为 %d", got)
+	}
+}
+
+func TestEmbeddedEndpointInboundUsesHostNetwork(t *testing.T) {
+	if !isEmbeddedEndpointInbound("fanout-openvpn-1") {
+		t.Fatal("OpenVPN endpoint 内部标签未被识别")
+	}
+	if isEmbeddedEndpointInbound("in-443-tcp") {
+		t.Fatal("普通入站不应被当作 OpenVPN endpoint")
+	}
+}
 
 func TestRequireWriteRequest(t *testing.T) {
 	for _, tc := range []struct {

@@ -18,9 +18,8 @@ type SocksCred struct {
 	Pass string `json:"pass"`
 }
 
-// Tunnel is one VPN Gate exit. Each tunnel owns an isolated sing-box process
-// with a userspace OpenVPN endpoint, an authenticated public SOCKS listener,
-// and a loopback-only SOCKS listener for the gateway process.
+// Tunnel is one VPN Gate exit. Its userspace OpenVPN endpoint and authenticated
+// public SOCKS listener are dynamically owned by the shared embedded sing-box.
 type Tunnel struct {
 	Slot    int       `json:"slot"`
 	RouteID string    `json:"-"`
@@ -34,12 +33,21 @@ type Tunnel struct {
 
 	endpointPort  int
 	proc          *singBoxProc
+	engine        *embeddedEngine
 	mu            sync.Mutex
 	stateMu       sync.RWMutex
 	lifecycleMu   sync.Mutex
 	adminMu       sync.Mutex
 	reconnectMu   sync.Mutex
 	portMayChange bool
+}
+
+// embeddedEngine is assigned by Manager so tunnel health probes and lifecycle
+// operations address the shared Box directly.
+func (t *Tunnel) setEngine(engine *embeddedEngine) {
+	t.mu.Lock()
+	t.engine = engine
+	t.mu.Unlock()
 }
 
 type tunnelSnapshot struct {
@@ -115,12 +123,37 @@ func (t *Tunnel) startSingBox(bin, workDir string) error {
 	return t.startSingBoxLocked(bin, workDir)
 }
 
-// startSingBoxLocked starts this tunnel while the lifecycle lock is held. A
-// Stop cannot pass this point until the newly started child is owned by proc,
-// which prevents an untracked child from surviving a concurrent stop.
+// startSingBoxLocked starts this tunnel while the lifecycle lock is held.
 func (t *Tunnel) startSingBoxLocked(bin, workDir string) error {
 	if t.snapshot().Status == "stopped" {
 		return fmt.Errorf("隧道已停止")
+	}
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+	if engine != nil {
+		for attempts := 0; attempts < 3; attempts++ {
+			state := t.snapshot()
+			if !portAvailable(state.Port, "tcp") {
+				if !t.publicPortMayChange() {
+					return fmt.Errorf("公网 SOCKS5 端口 %d 已被占用", state.Port)
+				}
+				next, err := freeRandomPort(map[int]bool{state.Port: true})
+				if err != nil {
+					return fmt.Errorf("公网 SOCKS5 端口 %d 已被占用且无法分配备用端口: %w", state.Port, err)
+				}
+				t.setPublicPort(next)
+				continue
+			}
+			if err := engine.addTunnel(t); err != nil {
+				return err
+			}
+			t.mu.Lock()
+			t.portMayChange = false
+			t.mu.Unlock()
+			return nil
+		}
+		return fmt.Errorf("无法分配可用的公网 SOCKS5 端口")
 	}
 	t.mu.Lock()
 	if t.endpointPort == 0 {
@@ -204,8 +237,13 @@ func (t *Tunnel) stopEngine() {
 
 func (t *Tunnel) stopEngineLocked() {
 	t.mu.Lock()
+	engine := t.engine
 	proc := t.proc
 	t.mu.Unlock()
+	if engine != nil {
+		engine.removeTunnel(t)
+		return
+	}
 	if proc != nil {
 		proc.stop()
 	}
@@ -214,6 +252,9 @@ func (t *Tunnel) stopEngineLocked() {
 func (t *Tunnel) internalProxyAddr() (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.engine != nil {
+		return "", fmt.Errorf("嵌入式 OpenVPN endpoint 不使用 loopback SOCKS5")
+	}
 	if t.endpointPort == 0 || t.proc == nil || t.proc.exited() {
 		return "", fmt.Errorf("OpenVPN endpoint 未运行")
 	}
@@ -229,6 +270,12 @@ func (t *Tunnel) internalProxyPort() int {
 func (t *Tunnel) dial(network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" {
 		return nil, fmt.Errorf("只支持 TCP")
+	}
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+	if engine != nil {
+		return engine.dialTunnel(context.Background(), t, network, addr)
 	}
 	proxyAddr, err := t.internalProxyAddr()
 	if err != nil {
@@ -249,10 +296,9 @@ func (t *Tunnel) setCredential(c SocksCred) {
 	t.Cred = c
 }
 
-// restartWithCredential restarts only this tunnel's sing-box process. The
-// gateway uses the separate unauthenticated loopback listener, so its process
-// and all other exits remain untouched. Restore the old configuration if the
-// replacement cannot start.
+// restartWithCredential recreates only this exit's public SOCKS listener. The
+// OpenVPN endpoint and all other listeners stay running. Restore the old
+// configuration if the replacement cannot start.
 func (t *Tunnel) restartWithCredential(bin, workDir string, next SocksCred) error {
 	t.lifecycleMu.Lock()
 	defer t.lifecycleMu.Unlock()
@@ -261,6 +307,20 @@ func (t *Tunnel) restartWithCredential(bin, workDir string, next SocksCred) erro
 	}
 	previous := t.credential()
 	t.setCredential(next)
+	t.mu.Lock()
+	engine := t.engine
+	t.mu.Unlock()
+	if engine != nil {
+		if err := engine.updateTunnelCredential(t); err == nil {
+			return nil
+		} else {
+			t.setCredential(previous)
+			if rollbackErr := engine.updateTunnelCredential(t); rollbackErr != nil {
+				return fmt.Errorf("更新公网 SOCKS5 凭据失败: %w；恢复旧凭据也失败: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("更新公网 SOCKS5 凭据失败: %w", err)
+		}
+	}
 	if err := t.startSingBoxLocked(bin, workDir); err == nil {
 		return nil
 	} else {
@@ -311,13 +371,15 @@ func (t *Tunnel) waitExitIP(timeout time.Duration) (string, error) {
 			lastErr = err
 		}
 		t.mu.Lock()
-		proc := t.proc
+		engine, proc := t.engine, t.proc
 		t.mu.Unlock()
-		if proc == nil {
-			return "", fmt.Errorf("sing-box 隧道进程未启动")
-		}
-		if proc.exited() {
-			return "", fmt.Errorf("sing-box 隧道进程已退出，详见 %s", filepath.Join(proc.dir, proc.name+".log"))
+		if engine == nil {
+			if proc == nil {
+				return "", fmt.Errorf("sing-box 隧道进程未启动")
+			}
+			if proc.exited() {
+				return "", fmt.Errorf("sing-box 隧道进程已退出，详见 %s", filepath.Join(proc.dir, proc.name+".log"))
+			}
 		}
 		time.Sleep(time.Second)
 	}

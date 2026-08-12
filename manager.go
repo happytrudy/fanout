@@ -10,29 +10,23 @@ import (
 
 // Manager 维护所有隧道，负责分配槽位与端口。
 type Manager struct {
-	mu         sync.RWMutex
-	tunnels    map[int]*Tunnel
-	nodes      []Node
-	fetched    time.Time
-	workDir    string
-	singBoxBin string
-	maxSlots   int
-	jobs       JobStore
-	stateMu    sync.Mutex
+	mu       sync.RWMutex
+	tunnels  map[int]*Tunnel
+	nodes    []Node
+	fetched  time.Time
+	workDir  string
+	maxSlots int
+	jobs     JobStore
+	stateMu  sync.Mutex
+	engine   *embeddedEngine
 }
 
-func NewManager(maxSlots int, workDir string, binary ...string) *Manager {
-	m := &Manager{
+func NewManager(maxSlots int, workDir string) *Manager {
+	return &Manager{
 		tunnels:  map[int]*Tunnel{},
 		workDir:  workDir,
 		maxSlots: maxSlots,
 	}
-	if len(binary) > 0 && binary[0] != "" {
-		m.singBoxBin, _ = findSingBox(workDir, binary...)
-	} else {
-		m.singBoxBin, _ = findSingBox(workDir)
-	}
-	return m
 }
 
 // RefreshNodes 重新拉取节点列表。
@@ -122,6 +116,9 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 		Since:         time.Now(),
 		Cred:          cred,
 		portMayChange: true,
+	}
+	if m.engine != nil {
+		t.setEngine(m.engine)
 	}
 	m.tunnels[slot] = t
 	m.mu.Unlock()
@@ -256,15 +253,18 @@ func (m *Manager) tunnelActive(t *Tunnel) bool {
 
 // tryNode 尝试用当前节点把隧道拉起来。
 func (m *Manager) tryNode(t *Tunnel) error {
-	if m.singBoxBin == "" {
-		return fmt.Errorf("sing-box 不可用")
-	}
-	portWasPending := t.publicPortMayChange()
-	if err := t.startSingBox(m.singBoxBin, m.workDir); err != nil {
+	engine, err := m.embeddedEngine()
+	if err != nil {
 		return err
 	}
-	// A first successful child fixes the public port. Persist it immediately:
-	// a random fallback must survive a crash before the VPN handshake finishes.
+	t.setEngine(engine)
+	portWasPending := t.publicPortMayChange()
+	if err := t.startSingBox("", m.workDir); err != nil {
+		return err
+	}
+	// A first listener may have had to choose a different random port after a
+	// bind race. Persist it before the comparatively slow VPN handshake so a
+	// process crash cannot restore the stale port.
 	if portWasPending && !t.publicPortMayChange() {
 		if err := m.saveState(); err != nil {
 			t.stopEngine()
@@ -284,6 +284,31 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	}
 	t.setExitIP(ip)
 	return nil
+}
+
+func (m *Manager) embeddedEngine() (*embeddedEngine, error) {
+	m.mu.RLock()
+	engine := m.engine
+	m.mu.RUnlock()
+	if engine != nil {
+		return engine, nil
+	}
+	panel, err := openPanel()
+	if err != nil {
+		return nil, fmt.Errorf("内嵌 sing-box 不可用: %w", err)
+	}
+	native, ok := panel.(*Native)
+	if !ok || native.embeddedEngine() == nil {
+		return nil, fmt.Errorf("内嵌 sing-box 不可用")
+	}
+	engine = native.embeddedEngine()
+	m.mu.Lock()
+	if m.engine == nil {
+		m.engine = engine
+	}
+	engine = m.engine
+	m.mu.Unlock()
+	return engine, nil
 }
 
 // candidatesFor 以指定节点打头，后面跟上同地区的其他节点作为备选。
@@ -389,7 +414,7 @@ func (m *Manager) StopAll() {
 }
 
 // SetCred 改一条出口的 SOCKS5 凭据。cred 两个字段都为空表示随机重置。
-// 公网 SOCKS 由该出口自己的 sing-box 直接提供，因此只需要重启这一条隧道。
+// 只会重建该出口的公网 SOCKS 监听，不会影响其他出口或自建入站。
 func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	m.mu.RLock()
 	t, ok := m.tunnels[slot]
@@ -420,15 +445,15 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	if t.snapshot().Status != "up" {
 		return SocksCred{}, fmt.Errorf("出口尚未就绪，当前状态为 %s", t.snapshot().Status)
 	}
-	if m.singBoxBin == "" {
-		return SocksCred{}, fmt.Errorf("sing-box 不可用")
+	if m.engine == nil {
+		return SocksCred{}, fmt.Errorf("内嵌 sing-box 不可用")
 	}
 	previous := t.credential()
-	if err := t.restartWithCredential(m.singBoxBin, m.workDir, cred); err != nil {
+	if err := t.restartWithCredential("", m.workDir, cred); err != nil {
 		return SocksCred{}, err
 	}
 	if err := m.saveState(); err != nil {
-		if rollbackErr := t.restartWithCredential(m.singBoxBin, m.workDir, previous); rollbackErr != nil {
+		if rollbackErr := t.restartWithCredential("", m.workDir, previous); rollbackErr != nil {
 			return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败: %w；恢复旧凭据也失败: %v", err, rollbackErr)
 		}
 		return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败，已恢复旧凭据: %w", err)

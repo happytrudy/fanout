@@ -15,15 +15,17 @@ fanout 统一由 sing-box 管理节点入站和 VPN Gate 出口，建站、改�
 
 ## 原理
 
-每个出口启动一个独立的 sing-box 进程。进程内使用 `system: false` 的 OpenVPN
-endpoint 和 gVisor 用户态网络栈，不创建系统 TUN 接口，也不改宿主路由或防火墙。
-每个隧道进程同时监听公网 SOCKS5，并在 sing-box 内完成用户名和口令认证；它还保留一个
-仅限 `127.0.0.1` 的无认证 SOCKS5，供节点链接网关转发使用。因此公网 SOCKS 数据不经过
-fanout 进程，换节点、掉线重连或修改 SOCKS 凭据都只影响这一条出口。
+fanout 内嵌一个 sing-box 1.14 核心，使用 `system: false` 的 OpenVPN endpoint 和 gVisor
+用户态网络栈，不创建系统 TUN 接口，也不改宿主路由或防火墙。出口、认证 SOCKS5 监听器和
+VLESS / VMess / Trojan / Hysteria2 / TUIC 入站都在同一个 Box 中动态注册。
+
+每个出口有自己的 OpenVPN endpoint 与公网 SOCKS5 监听器，用户名和口令由 sing-box 直接
+认证，SOCKS 数据不经过 fanout 的 Go HTTP 服务。新建、停止或重连一个出口只增删对应的
+endpoint 与 SOCKS 监听；修改某个入站只重建该入站监听器，其他连接不受影响。
 
 ```
-客户端 ──> sing-box 公网 SOCKS5（认证）:随机端口 ──> OpenVPN endpoint ──> VPN Gate 节点
-节点链接网关 ──> sing-box loopback SOCKS5（仅本机） ──> OpenVPN endpoint
+客户端 ──> 内嵌 sing-box 公网 SOCKS5（认证）:随机端口 ──> OpenVPN endpoint ──> VPN Gate 节点
+节点链接 ──> 内嵌 sing-box 协议入站 ──> 动态路由 ──> OpenVPN endpoint 或 VPS 直连
 ```
 
 ## 安装
@@ -35,21 +37,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/happytrudy/fanout/main/insta
 ```
 
 会自动下载对应架构的预编译二进制。也可以 clone 仓库后在源码目录运行同一个脚本，
-那样会从源码编译（需要 Go 1.24+）。
+那样会从源码编译（需要 Go 1.25.5+）。
 
 安装脚本从源码编译时默认关闭 CGO，生成不依赖目标机 glibc 版本的静态二进制：
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -tags "netgo osusergo" \
+CGO_ENABLED=0 go build -trimpath -tags "netgo osusergo with_gvisor with_quic" \
   -ldflags="-s -w -X main.version=dev" -o fanout .
 ```
 
-安装脚本只会补齐 `curl` 和 `tar`，再下载 fanout 与最新版 sing-box 到
-`/var/lib/fanout/bin/`。运行时要求 sing-box `>=1.14.0`（支持后续版本），且必须带
-`with_openvpn,with_gvisor` 两个构建标签。也可以通过 `SINGBOX_VERSION=...` 指定版本。
+安装脚本只会补齐 `curl` 和 `tar`，不下载也不要求服务器上安装 `sing-box`。当前源码将
+`github.com/sagernet/sing-box v1.14.0-beta.14` 编译进 fanout；升级 sing-box 需要升级
+fanout 的 Go 依赖并重新构建，不接受运行时替换任意 `1.14.x` 二进制。
 
-OpenVPN endpoint 在 sing-box 1.14 中仍是预发布能力。生产使用前应先在目标地区
-实测 VPN Gate 节点兼容性；如果需要可重复部署，建议通过 `SINGBOX_VERSION=...` 固定版本。
+OpenVPN endpoint 在 sing-box 1.14 中仍是预发布能力。生产使用前应先在目标地区实测
+VPN Gate 节点兼容性。
 
 服务用 systemd 或 OpenRC 都能装，装完自动开机自启。
 
@@ -60,12 +62,7 @@ OpenVPN endpoint 在 sing-box 1.14 中仍是预发布能力。生产使用前应
 ./fanout -inbound-listen :: -web 8899 -dir /var/lib/fanout
 ```
 
-sing-box 默认从工作目录的 `bin/sing-box`、`/usr/local/bin/sing-box` 或 PATH 查找。二进制文件名
-不是默认值时，使用 `-bin` 指定；自定义文件必须放在工作目录的 `bin/` 下：
-
-```bash
-./fanout -bin sing-box-custom -dir /var/lib/fanout
-```
+`-bin` 参数为兼容旧启动命令保留，嵌入模式下会被忽略。
 
 Linux 默认会把 `::` 作为 IPv6 wildcard，并通常同时接受 IPv4-mapped 连接；如果系统开启了
 `net.ipv6.bindv6only=1`，它只会监听 IPv6，此时请改回 `0.0.0.0` 或调整系统 socket 策略。
@@ -174,8 +171,8 @@ f uninstall  # 卸载
 
 ## 已知限制
 
-- Hysteria2/TUIC 入站可以转发 TCP 和 UDP；出口通过每条隧道的 sing-box 内部 SOCKS
-  访问 OpenVPN。公网 SOCKS5 同样由对应隧道的 sing-box 直接提供并强制用户名口令认证。
+- Hysteria2/TUIC 入站可以转发 TCP 和 UDP；绑定 IPv4 OpenVPN 出口的域名优先解析 IPv4。
+  IPv6-only 目标直接从 VPS IPv6 出口连接；OpenVPN 端不做 NAT64。
 - VPN Gate 是志愿者节点，有相当比例已下线或满员（`AUTH_FAILED`）。
   启动时连不上会自动顺着同地区候选往下试，最多 6 个。
 - 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套一层反代。
@@ -184,7 +181,7 @@ f uninstall  # 卸载
 
 [MIT](LICENSE)。
 
-sing-box 是单独下载和运行的 GPLv3 程序，许可见其上游项目。
+fanout 链接了 sing-box 及其依赖；发布和再分发时应遵守其上游许可证。
 
 节点来自 [VPN Gate](https://www.vpngate.net/)（筑波大学的学术实验项目），
 本工具只是调用其公开的节点列表，并用 sing-box 的 OpenVPN client endpoint 连接，

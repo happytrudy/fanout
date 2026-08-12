@@ -37,8 +37,8 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		if state.Status != "up" || !bound[tunnelBinding(t)] {
 			continue
 		}
-		// Use the tunnel process' loopback SOCKS. The authenticated public SOCKS
-		// listener is intentionally not part of the gateway data path.
+		// This legacy static-config helper is retained for config-generation tests.
+		// The production gateway uses embeddedEngine instead.
 		serverPort := t.internalProxyPort()
 		internal := serverPort != 0
 		if serverPort == 0 {

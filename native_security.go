@@ -1,21 +1,21 @@
 package main
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -42,23 +42,16 @@ func checkRealityDest(dest, serverName string) error {
 	return nil
 }
 
-// realityKeys asks sing-box to generate the key pair in its native format.
+// realityKeys emits the same X25519 raw-url-base64 encoding used by sing-box.
+// The legacy binary argument is intentionally retained so existing callers do
+// not need an external sing-box executable after the embedded-engine migration.
 func realityKeys(bin string) (priv, pub string, err error) {
-	out, err := exec.Command(bin, "generate", "reality-keypair").Output()
+	_ = bin
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return "", "", fmt.Errorf("生成 REALITY 密钥失败: %w", err)
 	}
-	text := string(out)
-
-	rePriv := regexp.MustCompile(`(?i)private\s*key:\s*(\S+)`)
-	rePub := regexp.MustCompile(`(?i)public\s*key:\s*(\S+)`)
-
-	mp := rePriv.FindStringSubmatch(text)
-	mb := rePub.FindStringSubmatch(text)
-	if mp == nil || mb == nil {
-		return "", "", fmt.Errorf("无法解析 sing-box REALITY 密钥输出: %s", strings.TrimSpace(text))
-	}
-	return mp[1], mb[1], nil
+	return base64.RawURLEncoding.EncodeToString(key.Bytes()), base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), nil
 }
 
 // randomShortID 生成 REALITY 的 shortId。
