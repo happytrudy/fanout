@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -39,6 +42,28 @@ func TestTunnelSnapshotConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestRestoreStateDoesNotPublishPartialState(t *testing.T) {
+	dir := t.TempDir()
+	state := persistedState{Tunnels: []persistedTunnel{
+		{Slot: 1, RouteID: "exit-one", Port: 21001, HostName: "one", SocksUser: "userone", SocksPass: "passone"},
+		{Slot: 2, RouteID: "exit-two", Port: 70000, HostName: "two", SocksUser: "usertwo", SocksPass: "passtwo"},
+	}}
+	blob, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), blob, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(2, dir)
+	if _, err := m.restoreState(); err == nil {
+		t.Fatal("后续状态记录非法时恢复应失败")
+	}
+	if got := len(m.Tunnels()); got != 0 {
+		t.Fatalf("恢复失败不应留下部分隧道，got %d", got)
+	}
 }
 
 func TestReconnectRejectsConcurrentAttempt(t *testing.T) {

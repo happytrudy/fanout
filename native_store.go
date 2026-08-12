@@ -82,6 +82,20 @@ func (n *nativeInbound) netOrTCP() string {
 	return n.Network
 }
 
+// listenNetwork is the OS transport used by an inbound. WebSocket, gRPC and
+// HTTPUpgrade are application transports layered over TCP and therefore share
+// the same listening-port namespace.
+func (n *nativeInbound) listenNetwork() string {
+	return listenerNetwork(n.netOrTCP())
+}
+
+func listenerNetwork(network string) string {
+	if strings.EqualFold(strings.TrimSpace(network), "udp") {
+		return "udp"
+	}
+	return "tcp"
+}
+
 func (n *nativeInbound) listenOrIPv4() string {
 	if strings.TrimSpace(n.Listen) == "" {
 		return "0.0.0.0"
@@ -136,10 +150,162 @@ func loadNativeStore(dir string) (*nativeStore, error) {
 	if err := json.Unmarshal(blob, &st); err != nil {
 		return nil, fmt.Errorf("解析 %s 失败: %w", nativeStatePath(dir), err)
 	}
-	if st.NextID < 1 {
-		st.NextID = 1
+	if err := st.validate(); err != nil {
+		return nil, fmt.Errorf("校验 %s 失败: %w", nativeStatePath(dir), err)
 	}
 	return &st, nil
+}
+
+// validate rejects ambiguous persisted state before it can be rendered into
+// sing-box configurations. NextID is recovered for old files that stored a
+// stale counter, because reusing an existing ID would otherwise orphan a
+// child process and make subsequent mutations target the wrong inbound.
+func (s *nativeStore) validate() error {
+	seenIDs := make(map[int]bool, len(s.Inbounds))
+	seenListeners := make(map[string]bool, len(s.Inbounds))
+	maxID := 0
+	for _, inbound := range s.Inbounds {
+		if inbound == nil {
+			return fmt.Errorf("存在空入站记录")
+		}
+		if inbound.ID < 1 {
+			return fmt.Errorf("入站 ID %d 不合法", inbound.ID)
+		}
+		if seenIDs[inbound.ID] {
+			return fmt.Errorf("入站 ID %d 重复", inbound.ID)
+		}
+		seenIDs[inbound.ID] = true
+		if inbound.Port < 1 || inbound.Port > 65535 {
+			return fmt.Errorf("入站 %d 的端口 %d 不合法", inbound.ID, inbound.Port)
+		}
+		if err := validatePersistedInbound(inbound); err != nil {
+			return fmt.Errorf("入站 %d 无效: %w", inbound.ID, err)
+		}
+		listener := fmt.Sprintf("%s/%d", inbound.listenNetwork(), inbound.Port)
+		if seenListeners[listener] {
+			return fmt.Errorf("%s 监听重复", listener)
+		}
+		seenListeners[listener] = true
+		if inbound.ID > maxID {
+			maxID = inbound.ID
+		}
+	}
+	if s.NextID <= maxID {
+		s.NextID = maxID + 1
+	}
+	if s.NextID < 1 {
+		s.NextID = 1
+	}
+	return nil
+}
+
+// validatePersistedInbound checks configuration semantics that cannot be
+// inferred from the JSON schema. It deliberately does not probe ports or
+// external REALITY destinations: loading state must be deterministic and
+// should report a broken record before any child process is started.
+func validatePersistedInbound(inbound *nativeInbound) error {
+	protocol := strings.ToLower(strings.TrimSpace(inbound.Protocol))
+	if !nativeProtocols[protocol] {
+		return fmt.Errorf("不支持的协议 %q", inbound.Protocol)
+	}
+	network := strings.ToLower(strings.TrimSpace(inbound.Network))
+	if network == "" {
+		network = "tcp"
+	}
+	// XHTTP was supported by the historical Xray backend. Keep it loadable so
+	// openNativeConfigured can disable and annotate it for the user to delete.
+	if network == "xhttp" {
+		return nil
+	}
+	if !nativeNetworks[network] {
+		return fmt.Errorf("不支持的传输方式 %q", inbound.Network)
+	}
+	if network == "udp" && protocol != "hysteria2" && protocol != "tuic" {
+		return fmt.Errorf("UDP 只适用于 Hysteria2/TUIC")
+	}
+	if (protocol == "hysteria2" || protocol == "tuic") && network != "udp" {
+		return fmt.Errorf("%s 必须使用 UDP/QUIC", protocol)
+	}
+	security := strings.ToLower(strings.TrimSpace(inbound.Security))
+	if security == "" {
+		security = "none"
+	}
+	if !nativeSecurities[security] {
+		return fmt.Errorf("不支持的安全层 %q", inbound.Security)
+	}
+	if (protocol == "hysteria2" || protocol == "tuic") && security != "tls" {
+		return fmt.Errorf("%s 必须启用 TLS", protocol)
+	}
+	if security == "reality" && network != "tcp" && network != "grpc" {
+		return fmt.Errorf("REALITY 不支持 %s 传输", network)
+	}
+	enabledClients := 0
+	for _, client := range inbound.Clients {
+		if !client.Enable {
+			continue
+		}
+		enabledClients++
+		switch protocol {
+		case "vless", "vmess":
+			if !validUUID(client.ID) {
+				return fmt.Errorf("客户端 %q 的 UUID 无效", client.Email)
+			}
+			if client.Flow != "" && !visionCapable(protocol, network, security) {
+				return fmt.Errorf("客户端 %q 的 Vision 配置不适用于该入站", client.Email)
+			}
+		case "trojan", "hysteria2":
+			if strings.TrimSpace(client.Password) == "" {
+				return fmt.Errorf("客户端 %q 缺少密码", client.Email)
+			}
+		case "tuic":
+			if !validUUID(client.ID) || strings.TrimSpace(client.Password) == "" {
+				return fmt.Errorf("客户端 %q 的 TUIC UUID 或密码无效", client.Email)
+			}
+		}
+	}
+	if inbound.Enable && enabledClients == 0 {
+		return fmt.Errorf("没有启用的客户端")
+	}
+	switch security {
+	case "tls":
+		if inbound.TLS == nil || strings.TrimSpace(inbound.TLS.CertFile) == "" || strings.TrimSpace(inbound.TLS.KeyFile) == "" {
+			return fmt.Errorf("TLS 缺少证书或私钥路径")
+		}
+	case "reality":
+		if inbound.Reality == nil || strings.TrimSpace(inbound.Reality.Dest) == "" || strings.TrimSpace(inbound.Reality.PrivateKey) == "" || len(inbound.Reality.ServerNames) == 0 || len(inbound.Reality.ShortIDs) == 0 {
+			return fmt.Errorf("REALITY 缺少目标、私钥、server name 或 short ID")
+		}
+	}
+	return nil
+}
+
+func validUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, c := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *nativeStore) enabledInboundCount() int {
+	count := 0
+	for _, inbound := range s.Inbounds {
+		if inbound.Enable {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *nativeStore) save(dir string) error {
@@ -147,11 +313,7 @@ func (s *nativeStore) save(dir string) error {
 	if err != nil {
 		return err
 	}
-	tmp := nativeStatePath(dir) + ".tmp"
-	if err := os.WriteFile(tmp, blob, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, nativeStatePath(dir))
+	return writeDurableFile(nativeStatePath(dir), blob, 0600)
 }
 
 func (s *nativeStore) byID(id int) *nativeInbound {
@@ -166,7 +328,7 @@ func (s *nativeStore) byID(id int) *nativeInbound {
 func (s *nativeStore) usedPorts(network ...string) map[int]bool {
 	used := map[int]bool{}
 	for _, ib := range s.Inbounds {
-		if len(network) > 0 && network[0] != "" && ib.netOrTCP() != network[0] {
+		if len(network) > 0 && network[0] != "" && ib.listenNetwork() != listenerNetwork(network[0]) {
 			continue
 		}
 		used[ib.Port] = true

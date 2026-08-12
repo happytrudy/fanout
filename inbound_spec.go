@@ -73,7 +73,7 @@ func normalizeInboundSpec(spec NewInboundSpec, used map[int]bool, portRange ...i
 	// vmess+ws+tls 是很常见的组合，不该拦。
 
 	port := spec.Port
-	usedNetwork := network
+	usedNetwork := listenerNetwork(network)
 	if port == 0 {
 		p, err := freeRandomInboundPort(used, portMin, portMax, usedNetwork)
 		if err != nil {

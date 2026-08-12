@@ -10,9 +10,12 @@ import (
 // persistedTunnel 是隧道在磁盘上的形态。
 // 只存重建所需的信息，运行态（进程、监听）重启后重新建立。
 type persistedTunnel struct {
-	Slot        int    `json:"slot"`
-	RouteID     string `json:"route_id,omitempty"`
-	Port        int    `json:"port"`
+	Slot    int    `json:"slot"`
+	RouteID string `json:"route_id,omitempty"`
+	Port    int    `json:"port"`
+	// PortPending is set only before the first successful bind. Its absence in
+	// legacy state files deliberately means the published port is fixed.
+	PortPending bool   `json:"port_pending,omitempty"`
 	HostName    string `json:"hostname"`
 	CountryCode string `json:"country_code"`
 	Country     string `json:"country"`
@@ -28,49 +31,21 @@ type persistedState struct {
 
 func statePath(dir string) string { return filepath.Join(dir, "state.json") }
 
-// saveState 把当前隧道写入磁盘，供重启后恢复。
-func (m *Manager) saveState() error {
-	m.stateMu.Lock()
-	defer m.stateMu.Unlock()
-
-	var st persistedState
-	for _, t := range m.Tunnels() {
-		state := t.snapshot()
-		// 只跳过用户主动停掉的。starting/failed 的隧道也要存：
-		// 它们正在重连或等着重试，漏存会让重启后凭空少几个出口。
-		if state.Status == "stopped" {
-			continue
-		}
-		cred := t.credential()
-		st.Tunnels = append(st.Tunnels, persistedTunnel{
-			Slot:        state.Slot,
-			RouteID:     state.RouteID,
-			Port:        state.Port,
-			HostName:    state.Node.HostName,
-			CountryCode: state.Node.CountryCode,
-			Country:     state.Node.Country,
-			Config:      state.Node.Config,
-			SocksUser:   cred.User,
-			SocksPass:   cred.Pass,
-		})
-	}
-
-	blob, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := statePath(m.workDir)
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-*.tmp")
+// writeDurableFile atomically replaces path and synchronizes both the file and
+// containing directory. A successful configuration request must survive a
+// power loss just like state.json does.
+func writeDurableFile(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0600); err != nil {
+	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(blob); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -90,6 +65,41 @@ func (m *Manager) saveState() error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// saveState 把当前隧道写入磁盘，供重启后恢复。
+func (m *Manager) saveState() error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	var st persistedState
+	for _, t := range m.Tunnels() {
+		state := t.snapshot()
+		// 只跳过用户主动停掉的。starting/failed 的隧道也要存：
+		// 它们正在重连或等着重试，漏存会让重启后凭空少几个出口。
+		if state.Status == "stopped" {
+			continue
+		}
+		cred := t.credential()
+		st.Tunnels = append(st.Tunnels, persistedTunnel{
+			Slot:        state.Slot,
+			RouteID:     state.RouteID,
+			Port:        state.Port,
+			PortPending: t.publicPortMayChange(),
+			HostName:    state.Node.HostName,
+			CountryCode: state.Node.CountryCode,
+			Country:     state.Node.Country,
+			Config:      state.Node.Config,
+			SocksUser:   cred.User,
+			SocksPass:   cred.Pass,
+		})
+	}
+
+	blob, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeDurableFile(statePath(m.workDir), blob, 0600)
 }
 
 // restoreState 读回上次的隧道并逐条拉起。
@@ -165,25 +175,43 @@ func (m *Manager) restoreState() (int, error) {
 			return 0, fmt.Errorf("状态文件中槽位 %d 的 SOCKS5 凭据无效: %w", p.Slot, err)
 		}
 		t := &Tunnel{
-			Slot:          p.Slot,
-			RouteID:       routeID,
-			Port:          p.Port,
-			Node:          node,
-			Status:        "starting",
-			Cred:          cred,
-			portMayChange: false,
+			Slot:    p.Slot,
+			RouteID: routeID,
+			Port:    p.Port,
+			Node:    node,
+			Status:  "starting",
+			Cred:    cred,
+			// State written while an initial connection was pending is allowed to
+			// select another random port if the original was claimed before bind.
+			// Older files do not have this field and therefore preserve their port.
+			portMayChange: p.PortPending,
 		}
-		m.mu.Lock()
-		m.tunnels[p.Slot] = t
-		m.mu.Unlock()
 		seenSlots[p.Slot] = true
 		seenPorts[p.Port] = true
 		seenRouteIDs[routeID] = true
 		restored = append(restored, t)
 	}
+	// Do not publish a partial recovery. Every record above must validate before
+	// any tunnel becomes visible to health checks, the panel or saveState.
+	m.mu.Lock()
+	if len(m.tunnels) != 0 {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("管理器已包含运行中的隧道，不能恢复状态")
+	}
+	for _, t := range restored {
+		m.tunnels[t.Slot] = t
+	}
+	m.mu.Unlock()
 	// Legacy state files receive Route IDs during restore. Persist them before
 	// dialing so a crash during the first reconnect cannot orphan migrated binds.
 	if err := m.saveState(); err != nil {
+		m.mu.Lock()
+		for _, t := range restored {
+			if m.tunnels[t.Slot] == t {
+				delete(m.tunnels, t.Slot)
+			}
+		}
+		m.mu.Unlock()
 		return 0, fmt.Errorf("保存恢复后的状态失败: %w", err)
 	}
 	for _, t := range restored {

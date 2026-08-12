@@ -125,6 +125,16 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 	}
 	m.tunnels[slot] = t
 	m.mu.Unlock()
+	// Persist the starting entry before any network work begins. Otherwise a
+	// crash during OpenVPN setup loses a user-requested exit altogether.
+	if err := m.saveState(); err != nil {
+		m.mu.Lock()
+		if m.tunnels[slot] == t {
+			delete(m.tunnels, slot)
+		}
+		m.mu.Unlock()
+		return nil, fmt.Errorf("保存新出口状态失败: %w", err)
+	}
 
 	go m.bringUp(t, true)
 	return t, nil
@@ -249,8 +259,17 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	if m.singBoxBin == "" {
 		return fmt.Errorf("sing-box 不可用")
 	}
+	portWasPending := t.publicPortMayChange()
 	if err := t.startSingBox(m.singBoxBin, m.workDir); err != nil {
 		return err
+	}
+	// A first successful child fixes the public port. Persist it immediately:
+	// a random fallback must survive a crash before the VPN handshake finishes.
+	if portWasPending && !t.publicPortMayChange() {
+		if err := m.saveState(); err != nil {
+			t.stopEngine()
+			return fmt.Errorf("保存公网 SOCKS5 端口失败: %w", err)
+		}
 	}
 	if !m.tunnelActive(t) {
 		t.stopEngine()
@@ -310,16 +329,24 @@ func (m *Manager) candidatesFor(first Node) []Node {
 // Stop 停掉一条隧道并释放槽位。
 func (m *Manager) Stop(slot int) error {
 	invalidateInbounds()
-	m.mu.Lock()
+	m.mu.RLock()
 	t, ok := m.tunnels[slot]
-	if ok {
-		delete(m.tunnels, slot)
-	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
-	t.stop()
+	// Serialize Stop with a credential update. The manager entry must remain
+	// visible until the credential update has either persisted or rolled back.
+	t.adminMu.Lock()
+	defer t.adminMu.Unlock()
+	m.mu.Lock()
+	if m.tunnels[slot] != t {
+		m.mu.Unlock()
+		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
+	}
+	delete(m.tunnels, slot)
+	m.mu.Unlock()
+	t.stopLocked()
 	if err := m.saveState(); err != nil {
 		return fmt.Errorf("出口已停止，但保存状态失败: %w", err)
 	}
@@ -368,6 +395,11 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 	t, ok := m.tunnels[slot]
 	m.mu.RUnlock()
 	if !ok {
+		return SocksCred{}, fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
+	}
+	t.adminMu.Lock()
+	defer t.adminMu.Unlock()
+	if !m.tunnelActive(t) {
 		return SocksCred{}, fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
 

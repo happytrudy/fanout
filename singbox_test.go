@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestCompareSingBoxVersion(t *testing.T) {
 	min, _ := parseSingBoxVersion("sing-box version " + singBoxMinVersion)
@@ -34,5 +38,16 @@ func TestSingBoxCandidatesCustomName(t *testing.T) {
 	}
 	if _, err := findSingBox("/var/lib/fanout", "/opt/proxy/sing-box"); err == nil {
 		t.Fatal("带路径的自定义二进制参数应被拒绝")
+	}
+}
+
+func TestSingBoxProcWritePIDReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	proc := &singBoxProc{dir: filepath.Join(dir, "missing"), name: "inbound-1"}
+	if err := proc.writePID(123); err == nil {
+		t.Fatal("PID 目录不存在时应返回写入错误")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "missing", "inbound-1.pid")); !os.IsNotExist(err) {
+		t.Fatalf("写入失败时不应留下 PID 文件: %v", err)
 	}
 }

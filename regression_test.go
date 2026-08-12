@@ -133,6 +133,31 @@ func TestSaveStateSerializesConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestSaveStatePersistsPendingPortFlag(t *testing.T) {
+	dir := t.TempDir()
+	manager := &Manager{
+		workDir: dir,
+		tunnels: map[int]*Tunnel{1: {
+			Slot: 1, RouteID: "exit-one", Port: 20001, Status: "starting", portMayChange: true,
+			Node: Node{HostName: "jp1", Config: "profile"}, Cred: SocksCred{User: "user", Pass: "password"},
+		}},
+	}
+	if err := manager.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state persistedState
+	if err := json.Unmarshal(blob, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tunnels) != 1 || !state.Tunnels[0].PortPending {
+		t.Fatalf("pending public port should not be fixed: %+v", state)
+	}
+}
+
 func TestParallelHealthCheckUsesBoundedConcurrency(t *testing.T) {
 	tunnels := make([]*Tunnel, 6)
 	for i := range tunnels {

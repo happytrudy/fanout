@@ -7,12 +7,15 @@ import (
 
 // ExitInbound is an inbound attached to one exit.
 type ExitInbound struct {
-	ID       int    `json:"id"`
-	Port     int    `json:"port"`
-	Remark   string `json:"remark"`
-	Protocol string `json:"protocol"`
-	Enable   bool   `json:"enable"`
-	Tag      string `json:"tag"`
+	ID            int       `json:"id"`
+	Port          int       `json:"port"`
+	Remark        string    `json:"remark"`
+	Protocol      string    `json:"protocol"`
+	Enable        bool      `json:"enable"`
+	Tag           string    `json:"tag"`
+	RuntimeStatus string    `json:"runtime_status"`
+	RuntimeError  string    `json:"runtime_error,omitempty"`
+	RetryAt       time.Time `json:"retry_at,omitempty"`
 }
 
 // Exit 是界面上的一行：一条隧道加上挂在它出口的所有入站。
@@ -127,6 +130,7 @@ func (m *Manager) ExitsOf() ExitsView {
 		row := ExitInbound{
 			ID: ib.ID, Port: ib.Port, Remark: ib.Remark,
 			Protocol: ib.Protocol, Enable: ib.Enable, Tag: ib.Tag,
+			RuntimeStatus: ib.RuntimeStatus, RuntimeError: ib.RuntimeError, RetryAt: ib.RetryAt,
 		}
 		if i, ok := byHost[ib.BoundTo]; ib.BoundTo != "" && ok {
 			view.Exits[i].Inbounds = append(view.Exits[i].Inbounds, row)

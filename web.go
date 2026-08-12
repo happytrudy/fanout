@@ -553,6 +553,21 @@ function isNative(){ return view.backend === 'native'; }
 function backendName(){ return '自建 sing-box'; }
 
 const STATUS = {up:'已连通', starting:'连接中', failed:'失败', stopped:'已停止'};
+const INBOUND_RUNTIME = {running:'运行中', retrying:'守护重试中', stopped:'未运行', disabled:'已停用'};
+
+function inboundRuntimeLabel(i){
+  if(!isNative()) return '';
+  const status = i.runtime_status || (i.enable === false ? 'disabled' : 'stopped');
+  return INBOUND_RUNTIME[status] || status;
+}
+
+function inboundRuntimeTitle(i){
+  let title = inboundRuntimeLabel(i);
+  if(!title) return '';
+  if(i.runtime_error) title += '：' + i.runtime_error;
+  if(i.retry_at) title += '（下次重试 ' + new Date(i.retry_at).toLocaleTimeString() + '）';
+  return title;
+}
 
 function renderExits(){
   const list = $('#list');
@@ -572,9 +587,9 @@ function renderExits(){
   list.innerHTML = view.exits.map(e => {
     const label = e.exit_ip || (e.status === 'starting' ? '连接中…' : '—');
     const chips = (e.inbounds || []).length
-      ? e.inbounds.map(i => '<button class="chip" data-detail="' + i.id + '" title="'
-          + esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port) + '">'
-          + esc(i.protocol) + ' :' + i.port + '</button>').join('')
+      ? e.inbounds.map(i => { const runtime = inboundRuntimeTitle(i), label = inboundRuntimeLabel(i); return '<button class="chip" data-detail="' + i.id + '" title="'
+          + esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port + (runtime ? ' · ' + runtime : '')) + '">'
+          + esc(i.protocol) + ' :' + i.port + (label ? ' · ' + esc(label) : '') + '</button>').join('')
       : '<span class="chip none">无节点</span>';
     const err = e.status === 'failed' && e.err
       ? '<div class="errline" title="' + esc(e.err) + '">' + esc(e.err) + '</div>' : '';
@@ -612,11 +627,10 @@ function renderOrphans(){
     + '<span class="spacer"></span>'
     + '<button data-delorphans="1" title="删除这些入站">'
     + ICON.trash + '清理</button></div>'
-    + list.map(i =>
-        '<div class="orow">'
+    + list.map(i => { const runtime = inboundRuntimeTitle(i), label = inboundRuntimeLabel(i); return '<div class="orow">'
         + '<button class="chip" data-detail="' + i.id + '" title="'
-        +   esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port) + '">'
-        +   esc(i.remark || i.protocol) + ' :' + i.port + '</button>'
+        +   esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port + (runtime ? ' · ' + runtime : '')) + '">'
+        +   esc(i.remark || i.protocol) + ' :' + i.port + (label ? ' · ' + esc(label) : '') + '</button>'
         + '<span class="spacer"></span>'
         + (hasUp
             ? '<select class="obind" data-tag="' + esc(i.tag) + '">' + exitOptions('') + '</select>'
@@ -624,7 +638,7 @@ function renderOrphans(){
         + '<button class="icon danger" data-delone="' + i.id + '" data-name="'
         +   esc((i.remark || i.protocol) + ' :' + i.port) + '" title="删除这个入站">'
         +   ICON.trash + '</button>'
-        + '</div>').join('')
+        + '</div>' }).join('')
     + '</div>';
 }
 
@@ -960,12 +974,14 @@ function renderDetail(d){
   }).join('');
 
   $('#dtitle').textContent = (d.remark || '节点') + '　:' + d.port;
+  const runtime = inboundRuntimeTitle(d);
   $('#dbody').innerHTML = '<dl class="kv">'
     + '<dt>出口</dt><dd><select id="dbind" data-tag="' + esc(d.tag) + '">'
     +   exitOptions(owner ? owner.host : '') + '</select></dd>'
     + '<dt>协议</dt><dd>' + esc(d.protocol) + '　' + esc(d.network || '')
     +   (d.tls && d.tls !== 'none' ? '　' + esc(d.tls) : '') + '</dd>'
     + '<dt>监听</dt><dd>' + esc(d.listen || '0.0.0.0') + '</dd>'
+    + (runtime ? '<dt>运行</dt><dd title="' + esc(runtime) + '">' + esc(runtime) + '</dd>' : '')
     + '</dl>'
     + '<div class="editbar">'
     +   '<label class="ef"><span>备注</span>'

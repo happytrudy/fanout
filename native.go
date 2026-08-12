@@ -3,18 +3,29 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	maxNativeInboundProcesses = 64
+	nativeWatchInterval       = 5 * time.Second
+	nativeWatchBackoffMax     = time.Minute
+	nativeStartWorkers        = 8
 )
 
 // Native is fanout's sing-box-backed inbound manager.
 //
-// 入站数据存在 native.json，sing-box 的运行配置每次改动后整份重新生成。
-// 全量重写比增量改省心：配置是纯函数产物，不会出现改了一半的中间态。
+// 入站数据存在 native.json。每个启用的入站都由独立 sing-box 进程托管，
+// 因而改动一个入站不会中断其他入站上的客户端连接。
 type Native struct {
 	mu             sync.Mutex
 	dir            string
@@ -22,9 +33,43 @@ type Native struct {
 	inboundPortMin int
 	inboundPortMax int
 	store          *nativeStore
-	proc           *singBoxProc
-	configHash     [sha256.Size]byte
-	hasConfigHash  bool
+	// proc is the shared child-process template retained for compatibility with
+	// existing state/tests. Each enabled inbound gets its own derived process.
+	proc        *singBoxProc
+	procs       map[int]*singBoxProc
+	configHash  map[int][sha256.Size]byte
+	lastTunnels []*Tunnel
+	hasTunnels  bool
+	watchStop   chan struct{}
+	watchDone   chan struct{}
+	closed      bool
+	watchFails  map[int]nativeWatchFailure
+	watchErrors map[int]string
+}
+
+type nativeWatchFailure struct {
+	count int
+	next  time.Time
+	hash  [sha256.Size]byte
+}
+
+type inboundReconcileError struct {
+	failures map[int]error
+}
+
+func (e *inboundReconcileError) Error() string {
+	parts := make([]string, 0, len(e.failures))
+	for id, err := range e.failures {
+		parts = append(parts, fmt.Sprintf("入站 %d: %v", id, err))
+	}
+	return strings.Join(parts, "; ")
+}
+
+type inboundStartWork struct {
+	id   int
+	proc *singBoxProc
+	hash [sha256.Size]byte
+	cfg  map[string]any
 }
 
 func openNative(workDir string, listen ...string) (*Native, error) {
@@ -69,6 +114,9 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 			}
 		}
 	}
+	if count := store.enabledInboundCount(); count > maxNativeInboundProcesses {
+		return nil, fmt.Errorf("已启用 %d 个自建入站，超过 %d 个 sing-box 子进程上限；请先在 native.json 中禁用或删除多余入站", count, maxNativeInboundProcesses)
+	}
 	n := &Native{
 		dir:            workDir,
 		listenAddr:     listenAddr,
@@ -76,9 +124,19 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 		inboundPortMax: portMax,
 		store:          store,
 		proc:           &singBoxProc{bin: bin, dir: filepath.Join(workDir, "sing-box"), name: "gateway"},
+		procs:          make(map[int]*singBoxProc),
+		configHash:     make(map[int][sha256.Size]byte),
+		watchFails:     make(map[int]nativeWatchFailure),
+		watchErrors:    make(map[int]string),
+		watchStop:      make(chan struct{}),
+		watchDone:      make(chan struct{}),
 	}
-	// Stop a child left behind by an unclean fanout shutdown.
+	// Stop the legacy aggregate gateway left behind by pre-v3.0.2 versions.
 	n.proc.reapOrphan()
+	for _, inbound := range store.Inbounds {
+		n.inboundProc(inbound.ID).reapOrphan()
+	}
+	go n.watchInbounds()
 	return n, nil
 }
 
@@ -86,9 +144,31 @@ func (n *Native) Kind() string { return "native" }
 
 func (n *Native) Describe() string { return "fanout 自建 sing-box (>=1.14)" }
 
-// apply 重新生成配置并在内容确实变化时重启 sing-box，然后落盘。
+// apply regenerates each inbound's isolated sing-box configuration. Changes to
+// one inbound therefore restart only that inbound instead of all clients.
 // 调用方必须已持有 n.mu。
 func (n *Native) apply(tunnels []*Tunnel) error {
+	return n.reconcile(tunnels, true, nil)
+}
+
+// reconcile applies the current store to child processes. Persist is false
+// for the watchdog because restarting an exited child does not alter state.
+// 调用方必须已持有 n.mu。
+func (n *Native) reconcile(tunnels []*Tunnel, persist bool, forceIDs map[int]bool) error {
+	n.lastTunnels = append(n.lastTunnels[:0], tunnels...)
+	n.hasTunnels = true
+	if n.procs == nil {
+		n.procs = make(map[int]*singBoxProc)
+	}
+	if n.configHash == nil {
+		n.configHash = make(map[int][sha256.Size]byte)
+	}
+	if n.watchFails == nil {
+		n.watchFails = make(map[int]nativeWatchFailure)
+	}
+	if n.watchErrors == nil {
+		n.watchErrors = make(map[int]string)
+	}
 	// Upgrade hostname-based bindings from earlier releases. Route IDs stay
 	// stable across VPN Gate node swaps and avoid rewriting gateway routes.
 	legacy := make(map[string]string, len(tunnels))
@@ -102,43 +182,246 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 		}
 	}
 
-	// Listen address is a runtime setting, not part of each client record.
-	// Render shallow copies so changing -inbound-listen also affects old entries.
 	list := n.store.sorted()
-	render := make([]*nativeInbound, 0, len(list))
-	for _, ib := range list {
-		copy := *ib
-		copy.Listen = n.listenAddr
-		render = append(render, &copy)
+	desired := make(map[int]bool, len(list))
+	works := make([]inboundStartWork, 0, len(list))
+	failures := make(map[int]error)
+	for _, inbound := range list {
+		desired[inbound.ID] = inbound.Enable
+		proc := n.inboundProc(inbound.ID)
+		if !inbound.Enable {
+			proc.stop()
+			delete(n.configHash, inbound.ID)
+			delete(n.procs, inbound.ID)
+			delete(n.watchFails, inbound.ID)
+			delete(n.watchErrors, inbound.ID)
+			continue
+		}
+		work, err := n.prepareInboundWork(inbound, tunnels, time.Now(), forceIDs[inbound.ID])
+		if err != nil {
+			failures[inbound.ID] = err
+			continue
+		}
+		if work != nil {
+			works = append(works, *work)
+		}
 	}
-	cfg := buildSingBoxGatewayConfig(render, tunnels)
+	for _, result := range runInboundStarts(works) {
+		if result.err != nil {
+			n.recordWatchFailure(result.work.id, result.work.hash, time.Now(), result.err)
+			failures[result.work.id] = result.err
+			continue
+		}
+		n.configHash[result.work.id] = result.work.hash
+		delete(n.watchErrors, result.work.id)
+	}
+	for id, proc := range n.procs {
+		if desired[id] {
+			continue
+		}
+		proc.stop()
+		delete(n.configHash, id)
+		delete(n.procs, id)
+		delete(n.watchFails, id)
+		delete(n.watchErrors, id)
+	}
+	if len(failures) > 0 {
+		return &inboundReconcileError{failures: failures}
+	}
+	if !persist {
+		return nil
+	}
+	return n.store.save(n.dir)
+}
+
+// reconcileInbound renders and starts one enabled inbound worker. Keeping this
+// shared with the watchdog prevents recovery from drifting from normal apply.
+// 调用方必须已持有 n.mu。
+func (n *Native) prepareInboundWork(inbound *nativeInbound, tunnels []*Tunnel, now time.Time, force bool) (*inboundStartWork, error) {
+	copyInbound := *inbound
+	copyInbound.Listen = n.listenAddr
+	proc := n.inboundProc(inbound.ID)
+	cfg := buildSingBoxGatewayConfig([]*nativeInbound{&copyInbound}, tunnels)
 	configBlob, err := json.Marshal(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	hash := sha256.Sum256(configBlob)
-	hasInbounds := len(cfg["inbounds"].([]any)) > 0
-	if n.hasConfigHash && n.configHash == hash && (!hasInbounds || !n.proc.exited()) {
-		return n.store.save(n.dir)
+	if failure, ok := n.watchFails[inbound.ID]; ok && failure.hash == hash && !force && !nativeRetryDue(failure, now) {
+		return nil, nil
 	}
-	path, err := writeSingBoxConfig(n.proc.dir, n.proc.name, cfg)
+	if previous, ok := n.configHash[inbound.ID]; ok && previous == hash && !proc.exited() {
+		return nil, nil
+	}
+	return &inboundStartWork{id: inbound.ID, proc: proc, hash: hash, cfg: cfg}, nil
+}
+
+func startInboundWork(work inboundStartWork) error {
+	path, err := writeSingBoxConfig(work.proc.dir, work.proc.name, work.cfg)
 	if err != nil {
 		return err
 	}
-	if err := verifySingBoxConfig(n.proc.bin, path); err != nil {
+	if err := verifySingBoxConfig(work.proc.bin, path); err != nil {
 		return err
 	}
-	// 没有入站时不必留着进程占资源
-	if !hasInbounds {
-		n.proc.stop()
-		n.configHash, n.hasConfigHash = hash, true
-		return n.store.save(n.dir)
-	}
-	if err := n.proc.start(path); err != nil {
+	if err := work.proc.start(path); err != nil {
 		return err
 	}
-	n.configHash, n.hasConfigHash = hash, true
-	return n.store.save(n.dir)
+	if work.proc.exited() {
+		return fmt.Errorf("sing-box 启动后立即退出")
+	}
+	return nil
+}
+
+type inboundStartResult struct {
+	work inboundStartWork
+	err  error
+}
+
+func runInboundStarts(works []inboundStartWork) []inboundStartResult {
+	if len(works) == 0 {
+		return nil
+	}
+	workers := nativeStartWorkers
+	if workers > len(works) {
+		workers = len(works)
+	}
+	jobs := make(chan inboundStartWork)
+	results := make(chan inboundStartResult, len(works))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for work := range jobs {
+				results <- inboundStartResult{work: work, err: startInboundWork(work)}
+			}
+		}()
+	}
+	go func() {
+		for _, work := range works {
+			jobs <- work
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	out := make([]inboundStartResult, 0, len(works))
+	for result := range results {
+		out = append(out, result)
+	}
+	return out
+}
+
+func (n *Native) reconcileInbound(inbound *nativeInbound, tunnels []*Tunnel, now time.Time, force bool) error {
+	work, err := n.prepareInboundWork(inbound, tunnels, now, force)
+	if err != nil || work == nil {
+		return err
+	}
+	if err := startInboundWork(*work); err != nil {
+		n.recordWatchFailure(work.id, work.hash, now, err)
+		return err
+	}
+	n.configHash[work.id] = work.hash
+	delete(n.watchErrors, work.id)
+	return nil
+}
+
+func (n *Native) recordWatchFailure(id int, hash [sha256.Size]byte, now time.Time, err error) {
+	failure := n.watchFails[id]
+	if failure.hash != hash {
+		failure = nativeWatchFailure{hash: hash}
+	}
+	failure.count++
+	failure.next = now.Add(nativeRetryDelay(failure.count))
+	n.watchFails[id] = failure
+	if n.watchErrors == nil {
+		n.watchErrors = make(map[int]string)
+	}
+	if err != nil {
+		n.watchErrors[id] = strings.TrimSpace(err.Error())
+	}
+}
+
+func (n *Native) watchInbounds() {
+	ticker := time.NewTicker(nativeWatchInterval)
+	defer ticker.Stop()
+	defer close(n.watchDone)
+	for {
+		select {
+		case <-n.watchStop:
+			return
+		case now := <-ticker.C:
+			n.mu.Lock()
+			if n.closed {
+				n.mu.Unlock()
+				return
+			}
+			if n.hasTunnels {
+				n.watchExitedInbounds(now)
+			}
+			n.mu.Unlock()
+		}
+	}
+}
+
+// watchExitedInbounds restarts only workers that exited. Failed starts use a
+// per-inbound exponential backoff so a broken certificate or configuration
+// cannot execute sing-box check every five seconds forever.
+// 调用方必须已持有 n.mu。
+func (n *Native) watchExitedInbounds(now time.Time) {
+	for _, inbound := range n.store.Inbounds {
+		if !inbound.Enable {
+			continue
+		}
+		proc := n.inboundProc(inbound.ID)
+		if !proc.exited() {
+			// A worker that survives until the next sweep is considered stable.
+			delete(n.watchFails, inbound.ID)
+			continue
+		}
+		failure := n.watchFails[inbound.ID]
+		if !nativeRetryDue(failure, now) {
+			continue
+		}
+		if err := n.reconcileInbound(inbound, n.lastTunnels, now, false); err != nil {
+			log.Printf("自建入站 %d 守护重启失败（%s 后重试）: %v", inbound.ID, nativeRetryDelay(n.watchFails[inbound.ID].count), err)
+			continue
+		}
+	}
+}
+
+func nativeRetryDelay(failures int) time.Duration {
+	if failures < 1 {
+		return 0
+	}
+	delay := nativeWatchInterval
+	for i := 1; i < failures && delay < nativeWatchBackoffMax; i++ {
+		delay *= 2
+	}
+	if delay > nativeWatchBackoffMax {
+		return nativeWatchBackoffMax
+	}
+	return delay
+}
+
+func nativeRetryDue(failure nativeWatchFailure, now time.Time) bool {
+	return failure.next.IsZero() || !now.Before(failure.next)
+}
+
+func (n *Native) inboundProc(id int) *singBoxProc {
+	if n.procs == nil {
+		n.procs = make(map[int]*singBoxProc)
+	}
+	if proc := n.procs[id]; proc != nil {
+		return proc
+	}
+	proc := &singBoxProc{
+		bin: n.proc.bin, dir: n.proc.dir,
+		name: fmt.Sprintf("inbound-%d", id),
+	}
+	n.procs[id] = proc
+	return proc
 }
 
 // commitMutation applies a changed store. If sing-box rejects or cannot start
@@ -146,16 +429,60 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 // good runtime configuration.
 // The caller must hold n.mu.
 func (n *Native) commitMutation(before *nativeStore, tunnels []*Tunnel) error {
-	if err := n.apply(tunnels); err == nil {
+	changed := changedInboundIDs(before, n.store)
+	if err := n.reconcile(tunnels, true, changed); err == nil {
 		return nil
 	} else {
 		applyErr := err
+		var runtimeErr *inboundReconcileError
+		if errors.As(err, &runtimeErr) && !runtimeErr.affects(changed) {
+			// An unrelated worker is already broken. Persist the requested
+			// change and leave that worker under its own backoff instead of
+			// blocking all healthy inbound administration.
+			if saveErr := n.store.save(n.dir); saveErr != nil {
+				return fmt.Errorf("应用配置失败: %w；保存已应用的其他入站失败: %v", applyErr, saveErr)
+			}
+			log.Printf("部分自建入站未应用，但其他修改已保存: %v", applyErr)
+			return nil
+		}
 		n.store = before
-		if rollbackErr := n.apply(tunnels); rollbackErr != nil {
+		if rollbackErr := n.reconcile(tunnels, true, changed); rollbackErr != nil {
 			return fmt.Errorf("应用新配置失败: %w；恢复旧配置也失败: %v", applyErr, rollbackErr)
 		}
 		return applyErr
 	}
+}
+
+func (e *inboundReconcileError) affects(ids map[int]bool) bool {
+	for id := range e.failures {
+		if ids[id] {
+			return true
+		}
+	}
+	return false
+}
+
+func changedInboundIDs(before, after *nativeStore) map[int]bool {
+	changed := make(map[int]bool)
+	oldByID := make(map[int]*nativeInbound, len(before.Inbounds))
+	newByID := make(map[int]*nativeInbound, len(after.Inbounds))
+	for _, inbound := range before.Inbounds {
+		oldByID[inbound.ID] = inbound
+	}
+	for _, inbound := range after.Inbounds {
+		newByID[inbound.ID] = inbound
+	}
+	for id, inbound := range oldByID {
+		if next, ok := newByID[id]; !ok || !reflect.DeepEqual(inbound, next) {
+			changed[id] = true
+		}
+	}
+	for id, inbound := range newByID {
+		if old, ok := oldByID[id]; !ok || !reflect.DeepEqual(old, inbound) {
+			changed[id] = true
+		}
+	}
+	return changed
 }
 
 // OnTunnelsChanged 在隧道集合变化后重建配置。自建模式下出站直接由隧道列表
@@ -179,8 +506,27 @@ func (n *Native) SetInboundPortRange(min, max int) error {
 // Close 停掉自己拉起的 sing-box。
 func (n *Native) Close() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.proc.stop()
+	if n.closed {
+		n.mu.Unlock()
+		return
+	}
+	n.closed = true
+	if n.watchStop != nil {
+		close(n.watchStop)
+	}
+	for _, proc := range n.procs {
+		proc.stop()
+	}
+	// Also clean up a legacy aggregate gateway if one was adopted during an
+	// interrupted upgrade.
+	if n.proc != nil {
+		n.proc.stop()
+	}
+	watchDone := n.watchDone
+	n.mu.Unlock()
+	if watchDone != nil {
+		<-watchDone
+	}
 }
 
 func (n *Native) Inbounds(live map[string]bool) ([]Inbound, error) {
@@ -190,10 +536,12 @@ func (n *Native) Inbounds(live map[string]bool) ([]Inbound, error) {
 	list := n.store.sorted()
 	out := make([]Inbound, 0, len(list))
 	for _, ib := range list {
+		status, runtimeErr, retryAt := n.inboundRuntime(ib)
 		out = append(out, Inbound{
 			ID: ib.ID, Port: ib.Port, Protocol: ib.Protocol,
 			Remark: ib.Remark, Enable: ib.Enable, Tag: ib.tag(),
 			BoundTo: ib.BoundTo, BoundUp: live[ib.BoundTo],
+			RuntimeStatus: status, RuntimeError: runtimeErr, RetryAt: retryAt,
 		})
 	}
 	return out, nil
@@ -213,10 +561,11 @@ func (n *Native) InboundDetail(id int, publicHost string) (*InboundDetail, error
 			Remark: ib.Remark, Enable: ib.Enable, Tag: ib.tag(),
 			BoundTo: ib.BoundTo,
 		},
-		Listen:  "0.0.0.0",
+		Listen:  n.listenAddr,
 		Network: ib.netOrTCP(),
 		TLS:     "none",
 	}
+	detail.RuntimeStatus, detail.RuntimeError, detail.RetryAt = n.inboundRuntime(ib)
 	for _, c := range ib.Clients {
 		id := c.ID
 		if ib.Protocol == "trojan" || ib.Protocol == "hysteria2" {
@@ -226,6 +575,40 @@ func (n *Native) InboundDetail(id int, publicHost string) (*InboundDetail, error
 		detail.Links = append(detail.Links, shareLink(ib, c, publicHost))
 	}
 	return detail, nil
+}
+
+// inboundRuntime reports the child-process state, rather than only the
+// persisted Enable switch. The caller must hold n.mu.
+func (n *Native) inboundRuntime(inbound *nativeInbound) (string, string, time.Time) {
+	if !inbound.Enable {
+		return "disabled", "", time.Time{}
+	}
+
+	proc := n.procs[inbound.ID]
+	if proc != nil && !proc.exited() {
+		return "running", "", time.Time{}
+	}
+
+	runtimeErr := n.watchErrors[inbound.ID]
+	if proc != nil {
+		if err, exited := proc.lastExit(); exited && runtimeErr == "" {
+			if err != nil {
+				runtimeErr = fmt.Sprintf("sing-box 子进程已退出: %v", err)
+			} else {
+				runtimeErr = "sing-box 子进程已退出"
+			}
+		}
+	}
+	if failure, ok := n.watchFails[inbound.ID]; ok {
+		if runtimeErr == "" {
+			runtimeErr = "sing-box 子进程未运行，等待守护重启"
+		}
+		return "retrying", runtimeErr, failure.next
+	}
+	if runtimeErr != "" {
+		return "retrying", runtimeErr, time.Time{}
+	}
+	return "stopped", runtimeErr, time.Time{}
 }
 
 func (n *Native) InboundLinks(ids []int, publicHost string) ([]string, error) {
@@ -327,21 +710,36 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 	for _, t := range tunnels {
 		byHost[t.snapshot().Node.HostName] = t
 	}
+	targets := make([]*Tunnel, 0, len(hosts))
+	seenHosts := make(map[string]bool, len(hosts))
+	for _, host := range hosts {
+		if seenHosts[host] {
+			continue
+		}
+		seenHosts[host] = true
+		t := byHost[host]
+		if t != nil && t.snapshot().Status == "up" {
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("没有可用的隧道")
+	}
+	if n.store.enabledInboundCount()+len(targets) > maxNativeInboundProcesses {
+		return nil, fmt.Errorf("复制后将运行 %d 个自建入站，超过 %d 个 sing-box 子进程上限", n.store.enabledInboundCount()+len(targets), maxNativeInboundProcesses)
+	}
 
-	used := n.store.usedPorts(tpl.netOrTCP())
-	if tpl.netOrTCP() == "tcp" {
+	listenerNet := tpl.listenNetwork()
+	used := n.store.usedPorts(listenerNet)
+	if listenerNet == "tcp" {
 		for port := range tunnelTCPPorts(tunnels) {
 			used[port] = true
 		}
 	}
 	created := []int{}
 	before := n.store.clone()
-	for _, host := range hosts {
-		t := byHost[host]
-		if t == nil || t.snapshot().Status != "up" {
-			continue
-		}
-		port, err := freeRandomInboundPort(used, n.inboundPortMin, n.inboundPortMax, tpl.netOrTCP())
+	for _, t := range targets {
+		port, err := freeRandomInboundPort(used, n.inboundPortMin, n.inboundPortMax, listenerNet)
 		if err != nil {
 			n.store = before
 			return nil, err
@@ -370,9 +768,6 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 		created = append(created, port)
 	}
 
-	if len(created) == 0 {
-		return created, fmt.Errorf("没有可用的隧道")
-	}
 	if err := n.commitMutation(before, tunnels); err != nil {
 		return nil, err
 	}
@@ -419,15 +814,15 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 			return fmt.Errorf("端口 %d 不在合法范围", port)
 		}
 		for _, other := range n.store.Inbounds {
-			if other.ID != id && other.Port == port && other.netOrTCP() == ib.netOrTCP() {
+			if other.ID != id && other.Port == port && other.listenNetwork() == ib.listenNetwork() {
 				return fmt.Errorf("端口 %d 已被入站 %q 占用", port, other.Remark)
 			}
 		}
-		if ib.netOrTCP() == "tcp" && tunnelUsesTCPPort(tunnels, port) {
+		if ib.listenNetwork() == "tcp" && tunnelUsesTCPPort(tunnels, port) {
 			return fmt.Errorf("端口 %d 已预留给公网 SOCKS5 出口", port)
 		}
-		if !portAvailable(port, ib.netOrTCP()) {
-			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", port, ib.netOrTCP(), "IPv4+IPv6")
+		if !portAvailable(port, ib.listenNetwork()) {
+			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", port, ib.listenNetwork(), "IPv4+IPv6")
 		}
 		ib.Port = port
 	}
@@ -437,15 +832,30 @@ func (n *Native) UpdateInbound(id int, patch InboundPatch, tunnels []*Tunnel) er
 		}
 	}
 	if patch.Enable != nil {
-		if *patch.Enable && ib.netOrTCP() == "tcp" && tunnelUsesTCPPort(tunnels, ib.Port) {
+		if *patch.Enable && !ib.Enable && n.store.enabledInboundCount() >= maxNativeInboundProcesses {
+			return fmt.Errorf("已达到 %d 个自建入站的 sing-box 子进程上限", maxNativeInboundProcesses)
+		}
+		if *patch.Enable && !ib.Enable && !hasEnabledClient(ib) {
+			return fmt.Errorf("入站没有启用的客户端，无法启用")
+		}
+		if *patch.Enable && ib.listenNetwork() == "tcp" && tunnelUsesTCPPort(tunnels, ib.Port) {
 			return fmt.Errorf("端口 %d 已预留给公网 SOCKS5 出口", ib.Port)
 		}
-		if *patch.Enable && !ib.Enable && !portChanged && !portAvailable(ib.Port, ib.netOrTCP()) {
-			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", ib.Port, ib.netOrTCP(), "IPv4+IPv6")
+		if *patch.Enable && !ib.Enable && !portChanged && !portAvailable(ib.Port, ib.listenNetwork()) {
+			return fmt.Errorf("端口 %d 的 %s/%s 监听已被占用", ib.Port, ib.listenNetwork(), "IPv4+IPv6")
 		}
 		ib.Enable = *patch.Enable
 	}
 	return n.commitMutation(before, tunnels)
+}
+
+func hasEnabledClient(inbound *nativeInbound) bool {
+	for _, client := range inbound.Clients {
+		if client.Enable {
+			return true
+		}
+	}
+	return false
 }
 
 // AddClient 给入站加一个客户端。同一入站上可以有多套凭据，便于分发给不同人。
@@ -571,6 +981,9 @@ var nativeProtocols = map[string]bool{"vless": true, "vmess": true, "trojan": tr
 func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*CreatedInbound, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.store.enabledInboundCount() >= maxNativeInboundProcesses {
+		return nil, fmt.Errorf("已达到 %d 个自建入站的 sing-box 子进程上限", maxNativeInboundProcesses)
+	}
 	before := n.store.clone()
 
 	requestedNetwork := strings.ToLower(strings.TrimSpace(spec.Network))
@@ -582,8 +995,9 @@ func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*Created
 			requestedNetwork = "tcp"
 		}
 	}
-	used := n.store.usedPorts(requestedNetwork)
-	if requestedNetwork == "tcp" {
+	listenerNet := listenerNetwork(requestedNetwork)
+	used := n.store.usedPorts(listenerNet)
+	if listenerNet == "tcp" {
 		for port := range tunnelTCPPorts(tunnels) {
 			used[port] = true
 		}

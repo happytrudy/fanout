@@ -37,6 +37,7 @@ type Tunnel struct {
 	mu            sync.Mutex
 	stateMu       sync.RWMutex
 	lifecycleMu   sync.Mutex
+	adminMu       sync.Mutex
 	reconnectMu   sync.Mutex
 	portMayChange bool
 }
@@ -88,6 +89,12 @@ func (t *Tunnel) setPublicPort(port int) {
 	t.stateMu.Lock()
 	t.Port = port
 	t.stateMu.Unlock()
+}
+
+func (t *Tunnel) publicPortMayChange() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.portMayChange
 }
 
 func (t *Tunnel) processName() string { return fmt.Sprintf("tunnel-%d", t.Slot) }
@@ -168,6 +175,17 @@ func (t *Tunnel) startSingBoxLocked(bin, workDir string) error {
 			return err
 		}
 		if err := proc.start(cfgPath); err != nil {
+			t.mu.Lock()
+			mayChange := t.portMayChange
+			t.mu.Unlock()
+			if mayChange && singBoxListenConflict(proc) {
+				next, portErr := freeRandomPort(map[int]bool{state.Port: true})
+				if portErr != nil {
+					return fmt.Errorf("公网 SOCKS5 端口 %d 被抢占且无法分配备用端口: %w", state.Port, portErr)
+				}
+				t.setPublicPort(next)
+				continue
+			}
 			return err
 		}
 		t.mu.Lock()
@@ -307,6 +325,12 @@ func (t *Tunnel) waitExitIP(timeout time.Duration) (string, error) {
 }
 
 func (t *Tunnel) stop() {
+	t.adminMu.Lock()
+	defer t.adminMu.Unlock()
+	t.stopLocked()
+}
+
+func (t *Tunnel) stopLocked() {
 	t.lifecycleMu.Lock()
 	defer t.lifecycleMu.Unlock()
 	t.setStatus("stopped", "")

@@ -26,6 +26,7 @@ type WebSettings struct {
 
 var (
 	webSettingsMu   sync.RWMutex
+	settingsTxnMu   sync.Mutex
 	webSettingsCur  WebSettings
 	webSettingsPath string
 )
@@ -81,11 +82,7 @@ func saveWebSettings() error {
 	if err != nil {
 		return err
 	}
-	tmp := webSettingsPath + ".tmp"
-	if err := os.WriteFile(tmp, blob, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, webSettingsPath)
+	return writeDurableFile(webSettingsPath, blob, 0600)
 }
 
 func setInboundPortRangeSettings(min, max int) error {

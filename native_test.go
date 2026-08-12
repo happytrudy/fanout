@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNativeInboundTagStable(t *testing.T) {
@@ -49,8 +51,8 @@ func TestBuildSingBoxConfigBindsOnlyLiveTunnels(t *testing.T) {
 	}
 
 	rules := cfg["route"].(map[string]any)["rules"].([]any)
-	if len(rules) != 3 {
-		t.Fatalf("应有 resolve、IPv6 直连和一个隧道路由，实际 %d 条", len(rules))
+	if len(rules) != 4 {
+		t.Fatalf("应有 resolve、IPv6 直连、隧道路由和离线出口阻断，实际 %d 条", len(rules))
 	}
 	if resolve := rules[0].(map[string]any); resolve["action"] != "resolve" || resolve["strategy"] != "prefer_ipv4" {
 		t.Errorf("缺少双栈域名优先 IPv4 的解析规则: %#v", resolve)
@@ -60,6 +62,22 @@ func TestBuildSingBoxConfigBindsOnlyLiveTunnels(t *testing.T) {
 	}
 	if got := rules[2].(map[string]any)["outbound"]; got != "fanout-jp1" {
 		t.Errorf("outbound = %v, want fanout-jp1", got)
+	}
+	if got := rules[3].(map[string]any)["outbound"]; got != "block" {
+		t.Errorf("离线绑定出口应阻断 IPv4，outbound = %v", got)
+	}
+}
+
+func TestBuildSingBoxConfigBlocksOfflineBoundInbound(t *testing.T) {
+	inbound := &nativeInbound{ID: 1, Port: 100, Protocol: "vless", Enable: true, BoundTo: "exit-missing"}
+	cfg := buildSingBoxGatewayConfig([]*nativeInbound{inbound}, nil)
+	rules := cfg["route"].(map[string]any)["rules"].([]any)
+	if len(rules) != 3 {
+		t.Fatalf("rules = %d, want 3", len(rules))
+	}
+	rule := rules[2].(map[string]any)
+	if rule["outbound"] != "block" || rule["inbound"].([]string)[0] != inbound.tag() {
+		t.Fatalf("离线绑定出口未被阻断: %#v", rule)
 	}
 }
 
@@ -158,6 +176,271 @@ func TestNativeMutationRollsBackWhenApplyFails(t *testing.T) {
 	}
 	if got := native.store.Inbounds[0].Remark; got != "old" {
 		t.Fatalf("应用失败后应回滚备注，got %q", got)
+	}
+}
+
+func TestNativeRestartsOnlyChangedInbound(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then exit 0; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	native := &Native{
+		dir: dir,
+		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+			{ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
+			{ID: 2, Port: 24002, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
+		}},
+		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
+	}
+	defer native.Close()
+	if err := native.apply(nil); err != nil {
+		t.Fatal(err)
+	}
+	first := native.inboundProc(1)
+	second := native.inboundProc(2)
+	if first.exited() || second.exited() {
+		t.Fatal("两个入站都应有独立进程")
+	}
+	firstPID := first.cmd.Process.Pid
+	secondPID := second.cmd.Process.Pid
+	if err := native.AddClient(1, "new-client", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := native.inboundProc(1).cmd.Process.Pid; got == firstPID {
+		t.Fatalf("修改入站 1 凭据后其进程未重启，pid=%d", got)
+	}
+	if got := native.inboundProc(2).cmd.Process.Pid; got != secondPID {
+		t.Fatalf("修改入站 1 不应重启入站 2，got pid=%d want %d", got, secondPID)
+	}
+	path := filepath.Join(dir, "sing-box", "inbound-1.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("缺少独立入站配置 %s: %v", path, err)
+	}
+}
+
+func TestNativeReconcilesExitedInboundWithoutRestartingPeers(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then exit 0; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	native := &Native{
+		dir: dir,
+		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+			{ID: 1, Port: 24101, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}}},
+			{ID: 2, Port: 24102, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "two", ID: newUUID(), Enable: true}}},
+		}},
+		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
+	}
+	defer native.Close()
+	if err := native.apply(nil); err != nil {
+		t.Fatal(err)
+	}
+	first := native.inboundProc(1)
+	second := native.inboundProc(2)
+	firstPID := first.cmd.Process.Pid
+	secondPID := second.cmd.Process.Pid
+	first.stop()
+	if err := native.reconcile(nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := native.inboundProc(1).cmd.Process.Pid; got == firstPID {
+		t.Fatalf("退出的入站 1 没有被重新拉起，pid=%d", got)
+	}
+	if got := native.inboundProc(2).cmd.Process.Pid; got != secondPID {
+		t.Fatalf("守护重启不应影响入站 2，got pid=%d want %d", got, secondPID)
+	}
+}
+
+func TestNativeStoreValidateRejectsDuplicateIDAndTCPListener(t *testing.T) {
+	duplicateID := &nativeStore{Inbounds: []*nativeInbound{{ID: 1, Port: 24001}, {ID: 1, Port: 24002}}}
+	if err := duplicateID.validate(); err == nil {
+		t.Fatal("重复入站 ID 应被拒绝")
+	}
+	duplicateTCP := &nativeStore{Inbounds: []*nativeInbound{{ID: 1, Port: 24001, Network: "ws"}, {ID: 2, Port: 24001, Network: "grpc"}}}
+	if err := duplicateTCP.validate(); err == nil {
+		t.Fatal("相同 TCP 监听端口应被拒绝")
+	}
+	staleNextID := &nativeStore{NextID: 1, Inbounds: []*nativeInbound{{ID: 3, Port: 24001, Protocol: "vless", Network: "tcp"}}}
+	if err := staleNextID.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if staleNextID.NextID != 4 {
+		t.Fatalf("next_id = %d, want 4", staleNextID.NextID)
+	}
+}
+
+func TestNativeStoreValidateRejectsInvalidProtocolCombination(t *testing.T) {
+	cases := []*nativeInbound{
+		{ID: 1, Port: 24001, Protocol: "unknown", Network: "tcp"},
+		{ID: 1, Port: 24001, Protocol: "vless", Network: "udp"},
+		{ID: 1, Port: 24001, Protocol: "hysteria2", Network: "udp", Security: "none"},
+		{ID: 1, Port: 24001, Protocol: "vless", Network: "ws", Security: "reality", Reality: &realityConfig{}},
+		{ID: 1, Port: 24001, Protocol: "trojan", Network: "tcp", Security: "tls"},
+	}
+	for _, inbound := range cases {
+		if err := (&nativeStore{Inbounds: []*nativeInbound{inbound}}).validate(); err == nil {
+			t.Fatalf("非法持久化入站应被拒绝: %#v", inbound)
+		}
+	}
+}
+
+func TestNativeStoreValidateRejectsInvalidClientCredentials(t *testing.T) {
+	cases := []*nativeInbound{
+		{ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Clients: []nativeClient{{Email: "vless", ID: "not-a-uuid", Enable: true}}},
+		{ID: 1, Port: 24001, Protocol: "trojan", Network: "tcp", Clients: []nativeClient{{Email: "trojan", Enable: true}}},
+		{ID: 1, Port: 24001, Protocol: "tuic", Network: "udp", Security: "tls", TLS: &tlsConfig{CertFile: "cert", KeyFile: "key"}, Clients: []nativeClient{{Email: "tuic", ID: newUUID(), Enable: true}}},
+	}
+	for _, inbound := range cases {
+		if err := (&nativeStore{Inbounds: []*nativeInbound{inbound}}).validate(); err == nil {
+			t.Fatalf("非法客户端凭据应被拒绝: %#v", inbound)
+		}
+	}
+}
+
+func TestNativeStoreValidateRejectsInboundWithoutEnabledClient(t *testing.T) {
+	store := &nativeStore{Inbounds: []*nativeInbound{{
+		ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Enable: true,
+		Clients: []nativeClient{{Email: "disabled", ID: newUUID(), Enable: false}},
+	}}}
+	if err := store.validate(); err == nil {
+		t.Fatal("启用入站没有启用客户端时应被拒绝")
+	}
+}
+
+func TestUpdateInboundRejectsEnableWithoutClient(t *testing.T) {
+	native := &Native{store: &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 24001, Protocol: "vless", Network: "tcp", Enable: false,
+		Clients: []nativeClient{{Email: "disabled", ID: newUUID(), Enable: false}},
+	}}}}
+	enable := true
+	if err := native.UpdateInbound(1, InboundPatch{Enable: &enable}, nil); err == nil {
+		t.Fatal("没有启用客户端的入站不应允许启用")
+	}
+}
+
+func TestNativeRejectsEnableBeyondWorkerLimit(t *testing.T) {
+	inbounds := make([]*nativeInbound, 0, maxNativeInboundProcesses+1)
+	for id := 1; id <= maxNativeInboundProcesses; id++ {
+		inbounds = append(inbounds, &nativeInbound{ID: id, Port: 25000 + id, Enable: true})
+	}
+	inbounds = append(inbounds, &nativeInbound{ID: maxNativeInboundProcesses + 1, Port: 26000, Enable: false})
+	native := &Native{store: &nativeStore{NextID: maxNativeInboundProcesses + 2, Inbounds: inbounds}}
+	enable := true
+	if err := native.UpdateInbound(maxNativeInboundProcesses+1, InboundPatch{Enable: &enable}, nil); err == nil {
+		t.Fatal("超过子进程上限时启用入站应被拒绝")
+	}
+}
+
+func TestNativeWatchRetryBackoff(t *testing.T) {
+	base := time.Unix(100, 0)
+	failure := nativeWatchFailure{count: 1, next: base.Add(nativeWatchInterval)}
+	if nativeRetryDue(failure, base.Add(nativeWatchInterval-time.Nanosecond)) {
+		t.Fatal("退避期限前不应重试")
+	}
+	if !nativeRetryDue(failure, base.Add(nativeWatchInterval)) {
+		t.Fatal("退避期限到达后应允许重试")
+	}
+	if got := nativeRetryDelay(5); got != nativeWatchBackoffMax {
+		t.Fatalf("退避上限 = %s, want %s", got, nativeWatchBackoffMax)
+	}
+}
+
+func TestNativeReconcileContinuesAfterInboundFailure(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then case \"$3\" in *inbound-1.json) exit 1;; *) exit 0;; esac; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	native := &Native{
+		dir: dir,
+		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+			{ID: 1, Port: 24301, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "bad", ID: newUUID(), Enable: true}}},
+			{ID: 2, Port: 24302, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "good", ID: newUUID(), Enable: true}}},
+		}},
+		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
+	}
+	defer native.Close()
+	if err := native.apply(nil); err == nil {
+		t.Fatal("第一个入站校验失败时应返回错误")
+	}
+	if native.inboundProc(1).exited() == false {
+		t.Fatal("失败入站不应启动")
+	}
+	if native.inboundProc(2).exited() {
+		t.Fatal("后续健康入站仍应完成启动")
+	}
+	list, err := native.Inbounds(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list[0].RuntimeStatus; got != "retrying" {
+		t.Fatalf("失败入站运行状态 = %q, want retrying", got)
+	}
+	if list[0].RuntimeError == "" {
+		t.Fatal("失败入站应公开最近错误")
+	}
+	if list[0].RetryAt.IsZero() {
+		t.Fatal("失败入站应公开下次重试时间")
+	}
+	if got := list[1].RuntimeStatus; got != "running" {
+		t.Fatalf("健康入站运行状态 = %q, want running", got)
+	}
+}
+
+func TestNativeInboundRuntimeReportsChildExit(t *testing.T) {
+	native := &Native{
+		store: &nativeStore{Inbounds: []*nativeInbound{{ID: 1, Enable: true}}},
+		procs: map[int]*singBoxProc{1: {lastExitErr: errors.New("exit status 1"), lastExitAt: time.Now()}},
+	}
+	list, err := native.Inbounds(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list[0].RuntimeStatus; got != "retrying" {
+		t.Fatalf("异常退出入站运行状态 = %q, want retrying", got)
+	}
+	if !strings.Contains(list[0].RuntimeError, "exit status 1") {
+		t.Fatalf("异常退出错误 = %q", list[0].RuntimeError)
+	}
+	detail, err := native.InboundDetail(1, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.RuntimeStatus != list[0].RuntimeStatus || detail.RuntimeError != list[0].RuntimeError {
+		t.Fatalf("详情运行状态与列表不一致: detail=%+v list=%+v", detail.Inbound, list[0])
+	}
+}
+
+func TestNativeMutationSurvivesUnrelatedBrokenInbound(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = \"check\" ]; then case \"$3\" in *inbound-1.json) exit 1;; *) exit 0;; esac; fi\nif [ \"$1\" = \"run\" ]; then exec sleep 30; fi\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	native := &Native{
+		dir: dir,
+		store: &nativeStore{NextID: 3, Inbounds: []*nativeInbound{
+			{ID: 1, Port: 24401, Protocol: "vless", Network: "tcp", Enable: true, Clients: []nativeClient{{Email: "broken", ID: newUUID(), Enable: true}}},
+			{ID: 2, Port: 24402, Protocol: "vless", Network: "tcp", Enable: true, Remark: "old", Clients: []nativeClient{{Email: "healthy", ID: newUUID(), Enable: true}}},
+		}},
+		proc: &singBoxProc{bin: bin, dir: filepath.Join(dir, "sing-box"), name: "gateway"},
+	}
+	defer native.Close()
+	if err := native.apply(nil); err == nil {
+		t.Fatal("初始坏入站应导致同步报错")
+	}
+	remark := "new"
+	if err := native.UpdateInbound(2, InboundPatch{Remark: &remark}, nil); err != nil {
+		t.Fatalf("无关坏入站不应阻止健康入站修改: %v", err)
+	}
+	if got := native.store.byID(2).Remark; got != remark {
+		t.Fatalf("健康入站修改未保存，got %q", got)
 	}
 }
 

@@ -338,6 +338,11 @@ func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式错误"})
 				return
 			}
+			// Password, base path, web listener and inbound range form one user
+			// transaction. Serialize them so a failed rollback cannot overwrite a
+			// concurrent settings request's newer values.
+			settingsTxnMu.Lock()
+			defer settingsTxnMu.Unlock()
 
 			oldWeb := getWebSettings()
 			nextWeb := oldWeb

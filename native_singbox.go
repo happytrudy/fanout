@@ -68,7 +68,17 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		map[string]any{"ip_version": 6, "action": "route", "outbound": "direct"},
 	}
 	for _, inbound := range inbounds {
-		if !inbound.Enable || inbound.BoundTo == "" || !live[inbound.BoundTo] {
+		if !inbound.Enable || inbound.BoundTo == "" {
+			continue
+		}
+		if !live[inbound.BoundTo] {
+			// A user-selected VPN must fail closed for IPv4 while it is down.
+			// The preceding IPv6 rule still intentionally lets IPv6-only targets
+			// use the VPS native route because OpenVPN exits are IPv4-only.
+			rules = append(rules, map[string]any{
+				"inbound": []string{inbound.tag()},
+				"action":  "route", "outbound": "block",
+			})
 			continue
 		}
 		rules = append(rules, map[string]any{

@@ -194,12 +194,14 @@ func trimCommandOutput(b []byte) string {
 // separate from the inbound gateway so replacing one VPN Gate node does not
 // interrupt every other exit.
 type singBoxProc struct {
-	mu   sync.Mutex
-	bin  string
-	dir  string
-	name string
-	cmd  *exec.Cmd
-	done chan error
+	mu          sync.Mutex
+	bin         string
+	dir         string
+	name        string
+	cmd         *exec.Cmd
+	done        chan error
+	lastExitErr error
+	lastExitAt  time.Time
 }
 
 func (p *singBoxProc) start(cfgPath string) error {
@@ -220,19 +222,32 @@ func (p *singBoxProc) start(cfgPath string) error {
 
 	done := make(chan error, 1)
 	p.mu.Lock()
-	p.cmd, p.done = cmd, done
+	p.cmd, p.done, p.lastExitErr, p.lastExitAt = cmd, done, nil, time.Time{}
 	p.mu.Unlock()
-	p.writePID(cmd.Process.Pid)
 	go func() {
 		err := cmd.Wait()
 		_ = f.Close()
 		p.mu.Lock()
 		if p.cmd == cmd {
 			p.cmd = nil
+			p.lastExitErr = err
+			p.lastExitAt = time.Now()
+			_ = os.Remove(p.pidPath())
 		}
 		p.mu.Unlock()
 		done <- err
 	}()
+	if err := p.writePID(cmd.Process.Pid); err != nil {
+		p.stop()
+		return fmt.Errorf("写入 sing-box PID 文件失败: %w", err)
+	}
+	// A very short-lived child can exit between cmd.Start and writePID. In that
+	// case the waiter may already have removed the PID before it was written.
+	// Remove it again so a later startup never mistakes this dead child for an
+	// orphan it needs to manage.
+	if p.exited() {
+		_ = os.Remove(p.pidPath())
+	}
 
 	select {
 	case err := <-done:
@@ -272,12 +287,33 @@ func (p *singBoxProc) exited() bool {
 	return p.cmd == nil
 }
 
+func (p *singBoxProc) lastExit() (error, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastExitErr, !p.lastExitAt.IsZero()
+}
+
+// singBoxListenConflict recognizes the startup error emitted when another
+// process claims a public listener between fanout's availability probe and
+// sing-box binding it. The log is the only detail retained by exec.Cmd here.
+func singBoxListenConflict(p *singBoxProc) bool {
+	blob, err := os.ReadFile(filepath.Join(p.dir, p.name+".log"))
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(blob))
+	return strings.Contains(text, "address already in use") || strings.Contains(text, "bind: address in use")
+}
+
 func (p *singBoxProc) pidPath() string {
 	return filepath.Join(p.dir, p.name+".pid")
 }
 
-func (p *singBoxProc) writePID(pid int) {
-	_ = os.WriteFile(p.pidPath(), []byte(strconv.Itoa(pid)), 0600)
+func (p *singBoxProc) writePID(pid int) error {
+	if err := os.WriteFile(p.pidPath(), []byte(strconv.Itoa(pid)), 0600); err != nil {
+		return fmt.Errorf("写入 %s 失败: %w", p.pidPath(), err)
+	}
+	return nil
 }
 
 func (p *singBoxProc) reapOrphan() {
