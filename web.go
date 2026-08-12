@@ -589,7 +589,7 @@ function renderExits(){
     const chips = (e.inbounds || []).length
       ? e.inbounds.map(i => { const runtime = inboundRuntimeTitle(i), label = inboundRuntimeLabel(i); return '<button class="chip" data-detail="' + i.id + '" title="'
           + esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port + (runtime ? ' · ' + runtime : '')) + '">'
-          + esc(i.protocol) + ' :' + i.port + (label ? ' · ' + esc(label) : '') + '</button>').join('')
+          + esc(i.protocol) + ' :' + i.port + (label ? ' · ' + esc(label) : '') + '</button>'; }).join('')
       : '<span class="chip none">无节点</span>';
     const err = e.status === 'failed' && e.err
       ? '<div class="errline" title="' + esc(e.err) + '">' + esc(e.err) + '</div>' : '';
