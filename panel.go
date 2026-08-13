@@ -81,7 +81,7 @@ var panelState struct {
 	listenAddr     string
 	inboundPortMin int
 	inboundPortMax int
-	binName        string
+	socksListenIP  string
 }
 
 func configurePanel(workDir string) {
@@ -93,17 +93,17 @@ func configurePanelWithListen(workDir, listenAddr string) {
 }
 
 func configurePanelWithListenRange(workDir, listenAddr string, min, max int) {
-	configurePanelWithListenRangeAndBin(workDir, listenAddr, min, max, "sing-box")
+	configurePanelWithListenRangeAndIP(workDir, listenAddr, min, max, "127.0.0.1")
 }
 
-func configurePanelWithListenRangeAndBin(workDir, listenAddr string, min, max int, binName string) {
+func configurePanelWithListenRangeAndIP(workDir, listenAddr string, min, max int, socksListenIP string) {
 	panelState.mu.Lock()
 	defer panelState.mu.Unlock()
 	panelState.workDir = workDir
 	panelState.listenAddr = listenAddr
 	panelState.inboundPortMin = min
 	panelState.inboundPortMax = max
-	panelState.binName = binName
+	panelState.socksListenIP = socksListenIP
 	panelState.current = nil
 }
 
@@ -116,7 +116,7 @@ func openPanel() (Panel, error) {
 		return panelState.current, nil
 	}
 
-	n, err := openNativeConfigured(panelState.workDir, panelState.listenAddr, panelState.inboundPortMin, panelState.inboundPortMax, panelState.binName)
+	n, err := openNativeConfigured(panelState.workDir, panelState.listenAddr, panelState.inboundPortMin, panelState.inboundPortMax, panelState.socksListenIP)
 	if err != nil {
 		return nil, err
 	}

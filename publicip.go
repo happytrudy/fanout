@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -36,6 +37,40 @@ func setPublicIPOverride(ip string) {
 	publicIPMu.Lock()
 	publicIPOverride = strings.TrimSpace(ip)
 	publicIPMu.Unlock()
+}
+
+// validateLocalIPv4 requires an address used for a bound SOCKS listener to be
+// configured on this machine. Binding a non-local address would fail later
+// with a vague "cannot assign requested address" error.
+func validateLocalIPv4(ip string) error {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil || parsed.To4() == nil {
+		return fmt.Errorf("SOCKS5 监听地址必须是 IPv4 地址: %q", ip)
+	}
+	target := parsed.To4()
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("读取本机网卡地址失败: %w", err)
+	}
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var candidate net.IP
+			switch value := addr.(type) {
+			case *net.IPNet:
+				candidate = value.IP
+			case *net.IPAddr:
+				candidate = value.IP
+			}
+			if candidate != nil && candidate.To4() != nil && candidate.To4().Equal(target) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("IPv4 %s 不是本机网卡地址，无法监听 SOCKS5", ip)
 }
 
 // hostPublicIP 返回跑 fanout 这台母机的公网 IPv4。

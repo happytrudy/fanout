@@ -13,7 +13,7 @@ import (
 
 func newNativeForEmbeddedTest(t *testing.T, store *nativeStore) *Native {
 	t.Helper()
-	engine, err := newEmbeddedEngine()
+	engine, err := newEmbeddedEngine("127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +73,17 @@ func TestNativeRestoresBoundInboundWhenExitComesUp(t *testing.T) {
 	}
 	if !native.engine.hasInbound(1, "in-24012-tcp") {
 		t.Fatal("出口恢复后绑定入站应重新开始监听")
+	}
+}
+
+func TestEmbeddedEngineUsesConfiguredSocksListenIP(t *testing.T) {
+	engine, err := newEmbeddedEngine("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.close()
+	if engine.listenIP != "127.0.0.1" {
+		t.Fatalf("SOCKS5 监听地址 = %q, want 127.0.0.1", engine.listenIP)
 	}
 }
 

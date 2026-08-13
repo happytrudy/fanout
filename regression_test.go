@@ -21,7 +21,7 @@ func TestEmbeddedTunnelReassignsOnlyPendingOccupiedPort(t *testing.T) {
 	defer listener.Close()
 	occupied := listener.Addr().(*net.TCPAddr).Port
 
-	engine, err := newEmbeddedEngine()
+	engine, err := newEmbeddedEngine("127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +48,15 @@ func TestEmbeddedEndpointInboundUsesHostNetwork(t *testing.T) {
 	}
 	if isEmbeddedEndpointInbound("in-443-tcp") {
 		t.Fatal("普通入站不应被当作 OpenVPN endpoint")
+	}
+}
+
+func TestValidateLocalIPv4(t *testing.T) {
+	if err := validateLocalIPv4("127.0.0.1"); err != nil {
+		t.Fatalf("loopback IPv4 应可作为 SOCKS 监听地址: %v", err)
+	}
+	if err := validateLocalIPv4("192.0.2.1"); err == nil {
+		t.Fatal("未配置在本机的 IPv4 应被拒绝")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -51,6 +52,7 @@ type embeddedEngine struct {
 
 	inbounds map[int]embeddedInboundState
 	tunnels  map[int]embeddedTunnelState
+	listenIP string
 }
 
 type embeddedRoute struct {
@@ -77,11 +79,12 @@ type fanoutDynamicOutbound struct {
 	engine *embeddedEngine
 }
 
-func newEmbeddedEngine() (*embeddedEngine, error) {
+func newEmbeddedEngine(listenIP string) (*embeddedEngine, error) {
 	engine := &embeddedEngine{
 		routes:   make(map[string]embeddedRoute),
 		inbounds: make(map[int]embeddedInboundState),
 		tunnels:  make(map[int]embeddedTunnelState),
+		listenIP: listenIP,
 	}
 
 	inboundRegistry := sbinbound.NewRegistry()
@@ -225,6 +228,15 @@ func (e *embeddedEngine) hasTunnel(slot int) bool {
 	defer e.mu.Unlock()
 	_, found := e.tunnels[slot]
 	return found && e.box != nil
+}
+
+func (e *embeddedEngine) portAvailable(port int) bool {
+	listener, err := net.Listen("tcp4", net.JoinHostPort(e.listenIP, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = listener.Close()
+	return true
 }
 
 func (e *embeddedEngine) createInbound(inbound *nativeInbound) error {
@@ -378,7 +390,7 @@ func (e *embeddedEngine) addTunnel(tunnel *Tunnel) error {
 
 	socksConfig := map[string]any{
 		"type": "socks", "tag": socksTag,
-		"listen": "0.0.0.0", "listen_port": state.Port,
+		"listen": e.listenIP, "listen_port": state.Port,
 	}
 	cred := tunnel.credential()
 	socksConfig["users"] = []any{map[string]any{"username": cred.User, "password": cred.Pass}}
@@ -435,7 +447,7 @@ func (e *embeddedEngine) updateTunnelCredential(tunnel *Tunnel) error {
 	cred := tunnel.credential()
 	raw := map[string]any{
 		"type": "socks", "tag": state.socksTag,
-		"listen": "0.0.0.0", "listen_port": snapshot.Port,
+		"listen": e.listenIP, "listen_port": snapshot.Port,
 		"users": []any{map[string]any{"username": cred.User, "password": cred.Pass}},
 	}
 	options, err := decodeSingBoxOptions[option.Inbound](e.ctx, raw)

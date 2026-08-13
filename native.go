@@ -53,10 +53,10 @@ func openNative(workDir string, listen ...string) (*Native, error) {
 	if len(listen) > 0 && strings.TrimSpace(listen[0]) != "" {
 		listenAddr = strings.TrimSpace(listen[0])
 	}
-	return openNativeConfigured(workDir, listenAddr, inboundPortMinDefault, inboundPortMaxDefault)
+	return openNativeConfigured(workDir, listenAddr, inboundPortMinDefault, inboundPortMaxDefault, "127.0.0.1")
 }
 
-func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, binary ...string) (*Native, error) {
+func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, socksListenIP string) (*Native, error) {
 	if workDir == "" {
 		return nil, fmt.Errorf("自建模式缺少工作目录")
 	}
@@ -69,7 +69,9 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 	if err := validatePortRange(portMin, portMax); err != nil {
 		return nil, err
 	}
-	_ = binary // Native is linked with sing-box; no external binary is used.
+	if err := validateLocalIPv4(socksListenIP); err != nil {
+		return nil, err
+	}
 	if count := reapLegacySingBoxProcesses(workDir); count > 0 {
 		log.Printf("已清理 %d 个旧版 sing-box 子进程", count)
 	}
@@ -90,7 +92,7 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 	if count := store.enabledInboundCount(); count > maxNativeInbounds {
 		return nil, fmt.Errorf("已启用 %d 个自建入站，超过 %d 个入站上限；请先在 native.json 中禁用或删除多余入站", count, maxNativeInbounds)
 	}
-	engine, err := newEmbeddedEngine()
+	engine, err := newEmbeddedEngine(socksListenIP)
 	if err != nil {
 		return nil, err
 	}

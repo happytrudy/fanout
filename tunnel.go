@@ -121,7 +121,7 @@ func (t *Tunnel) startSingBoxLocked() error {
 	}
 	for attempts := 0; attempts < 3; attempts++ {
 		state := t.snapshot()
-		if !portAvailable(state.Port, "tcp") {
+		if !engine.portAvailable(state.Port) {
 			if !t.publicPortMayChange() {
 				return fmt.Errorf("公网 SOCKS5 端口 %d 已被占用", state.Port)
 			}

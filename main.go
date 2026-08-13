@@ -124,15 +124,15 @@ func main() {
 		maxSlots      = flag.Int("max", 20, "最多同时运行的隧道数")
 		workDir       = flag.String("dir", "/var/lib/fanout", "工作目录")
 		inboundListen = flag.String("inbound-listen", "0.0.0.0", "自建节点监听地址；使用 :: 接收 IPv6/双栈连接")
-		singBoxName   = flag.String("bin", "sing-box", "已废弃：内嵌 sing-box 不使用外部二进制")
 	)
-	publicIP := flag.String("ip", "", "母机公网 IPv4，用于分享链接/SOCKS5 地址；留空则自动探测")
+	publicIP := flag.String("ip", "", "出口 SOCKS5 监听和页面展示 IPv4；必须属于本机网卡，留空则自动探测")
 	showVersion := flag.Bool("version", false, "显示版本后退出")
 	flag.Parse()
 
 	if *publicIP == "" {
 		*publicIP = os.Getenv("FANOUT_PUBLIC_IP")
 	}
+	*publicIP = strings.TrimSpace(*publicIP)
 
 	if *showVersion {
 		fmt.Println("fanout", version)
@@ -142,13 +142,21 @@ func main() {
 	if err := os.MkdirAll(*workDir, 0700); err != nil {
 		log.Fatalf("创建工作目录失败: %v", err)
 	}
+	if strings.TrimSpace(*publicIP) == "" {
+		*publicIP = probePublicIP()
+		if *publicIP == "" {
+			log.Fatal("无法自动探测 VPS 公网 IPv4，请使用 -ip 指定")
+		}
+	}
+	if err := validateLocalIPv4(*publicIP); err != nil {
+		log.Fatal(err)
+	}
 	setPublicIPOverride(*publicIP)
-	go hostPublicIP() // 预热探测，别让首个请求阻塞
 	webCfg, err := loadWebSettings(*workDir, *webPort)
 	if err != nil {
 		log.Fatalf("加载 Web 设置失败: %v", err)
 	}
-	configurePanelWithListenRangeAndBin(*workDir, *inboundListen, webCfg.InboundPortMin, webCfg.InboundPortMax, *singBoxName)
+	configurePanelWithListenRangeAndIP(*workDir, *inboundListen, webCfg.InboundPortMin, webCfg.InboundPortMax, *publicIP)
 	panel, panelErr := openPanel()
 	if panelErr != nil {
 		log.Printf("节点链接后端暂不可用（可在 Web 界面查看原因）: %v", panelErr)

@@ -39,6 +39,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/happytrudy/fanout/main/insta
 会自动下载对应架构的预编译二进制。也可以 clone 仓库后在源码目录运行同一个脚本，
 那样会从源码编译（需要 Go 1.25.5+）。
 
+`-ip` 同时决定出口 SOCKS5 的监听地址和页面展示地址，必须是本机网卡上的 IPv4：
+
+```bash
+# 只允许服务器本机访问 SOCKS5，页面也显示 127.0.0.1
+./fanout -ip 127.0.0.1
+
+# 只在这张公网网卡上监听，页面也显示该公网 IPv4
+./fanout -ip 203.0.113.10
+```
+
+不传 `-ip` 时，fanout 会先自动探测公网 IPv4、验证它属于本机网卡后再启动。探测失败或
+指定了不属于本机的地址会直接报错退出；`0.0.0.0` 不是可用于 `-ip` 的地址。
+
 安装脚本从源码编译时默认关闭 CGO，生成不依赖目标机 glibc 版本的静态二进制：
 
 ```bash
@@ -61,8 +74,6 @@ VPN Gate 节点兼容性。
 ```bash
 ./fanout -inbound-listen :: -web 8899 -dir /var/lib/fanout
 ```
-
-`-bin` 参数为兼容旧启动命令保留，嵌入模式下会被忽略。
 
 Linux 默认会把 `::` 作为 IPv6 wildcard，并通常同时接受 IPv4-mapped 连接；如果系统开启了
 `net.ipv6.bindv6only=1`，它只会监听 IPv6，此时请改回 `0.0.0.0` 或调整系统 socket 策略。
