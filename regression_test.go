@@ -61,16 +61,21 @@ func TestRequireWriteRequest(t *testing.T) {
 		remote          string
 		forward         string
 		standardForward string
+		fetchSite       string
 		code            int
 	}{
-		{"get", http.MethodGet, "", "fanout.example", "198.51.100.10:12345", "", "", http.StatusMethodNotAllowed},
-		{"cross-origin", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "", "", http.StatusForbidden},
-		{"post", http.MethodPost, "", "fanout.example", "198.51.100.10:12345", "", "", 0},
-		{"same host normalized", http.MethodPost, "https://PANEL.example", "panel.example:443", "198.51.100.10:12345", "", "", 0},
-		{"cloudflared forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "panel.example", "", 0},
-		{"cloudflared default https port", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "[::1]:12345", "panel.example:443", "", 0},
-		{"standard forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "", `for=192.0.2.10;host="panel.example";proto=https`, 0},
-		{"public forwarded header cannot bypass", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "attacker.example", "", http.StatusForbidden},
+		{"get", http.MethodGet, "", "fanout.example", "198.51.100.10:12345", "", "", "", http.StatusMethodNotAllowed},
+		{"cross-origin", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "", "", "cross-site", http.StatusForbidden},
+		{"post", http.MethodPost, "", "fanout.example", "198.51.100.10:12345", "", "", "", 0},
+		{"same host normalized", http.MethodPost, "https://PANEL.example", "panel.example:443", "198.51.100.10:12345", "", "", "", 0},
+		{"cloudflared forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "panel.example", "", "", 0},
+		{"cloudflared default https port", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "[::1]:12345", "panel.example:443", "", "", 0},
+		{"standard forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "", `for=192.0.2.10;host="panel.example";proto=https`, "", 0},
+		{"nginx local proxy without forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "", "", "same-origin", 0},
+		{"nginx local proxy cross site without metadata", http.MethodPost, "https://attacker.example", "127.0.0.1:8899", "127.0.0.1:12345", "", "", "", http.StatusForbidden},
+		{"cloudflare rewritten host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "162.158.1.1:12345", "", "", "same-origin", 0},
+		{"cross-site metadata cannot bypass", http.MethodPost, "https://attacker.example", "127.0.0.1:8899", "162.158.1.1:12345", "", "", "cross-site", http.StatusForbidden},
+		{"public forwarded header cannot bypass", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "attacker.example", "", "", http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, "http://fanout.example/api/stop", nil)
@@ -84,6 +89,9 @@ func TestRequireWriteRequest(t *testing.T) {
 			}
 			if tc.standardForward != "" {
 				req.Header.Set("Forwarded", tc.standardForward)
+			}
+			if tc.fetchSite != "" {
+				req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
 			}
 			rec := httptest.NewRecorder()
 			got := requireWriteRequest(rec, req)

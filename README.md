@@ -179,6 +179,20 @@ f uninstall  # 卸载
   Tunnel、cloudflared、Nginx 或 Caddy 运行在本机时可直接使用；fanout 只信任来自
   `127.0.0.1` / `::1` 的 `X-Forwarded-Host` / `Forwarded`，用于保证反代后的按钮请求仍通过同源校验。
 
+  Nginx 反代时应保留原始 Host（其中前两行是必须的）：
+
+  ```nginx
+  location /<随机访问路径>/ {
+      proxy_pass http://127.0.0.1:8899/<随机访问路径>/;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-Host $host;
+      proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  ```
+
+  Cloudflare CDN 或 Argo Tunnel 位于 Nginx 前面时无需另行修改 fanout；Nginx 会把 CDN
+  域名传给后端。新版浏览器也会通过 `Sec-Fetch-Site: same-origin` 兼容尚未添加这些头的旧配置。
+
 ## 许可
 
 [MIT](LICENSE)。

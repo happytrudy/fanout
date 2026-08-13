@@ -32,12 +32,20 @@ func requireWriteRequest(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if origin != "" {
 		u, err := url.Parse(origin)
-		if err != nil || u.Host == "" || !sameRequestHost(u.Host, requestHost(r)) {
+		if err != nil || u.Host == "" || (!sameRequestHost(u.Host, requestHost(r)) && !isSameOriginFetch(r)) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "跨站请求被拒绝"})
 			return false
 		}
 	}
 	return true
+}
+
+// isSameOriginFetch is the safe fallback for a managed proxy such as
+// Cloudflare's orange-cloud mode. Such a proxy can rewrite Host without
+// retaining X-Forwarded-Host, but browsers set this Fetch Metadata value and
+// do not allow page JavaScript on another origin to forge it.
+func isSameOriginFetch(r *http.Request) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "same-origin")
 }
 
 // requestHost returns the browser-visible host for the same-origin check.
