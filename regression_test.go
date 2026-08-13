@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +34,7 @@ func TestEmbeddedTunnelReassignsOnlyPendingOccupiedPort(t *testing.T) {
 		Node: Node{Config: testVPNGateProfile}, Cred: SocksCred{User: "user", Pass: "password"},
 	}
 	tunnel.setEngine(engine)
-	if err := tunnel.startSingBox("", t.TempDir()); err == nil {
+	if err := tunnel.startSingBox(); err == nil {
 		t.Fatal("已关闭的引擎不应启动隧道")
 	}
 	if got := tunnel.snapshot().Port; got == occupied {
@@ -128,42 +127,6 @@ func TestStoppedTunnelStatusIsTerminal(t *testing.T) {
 	}
 }
 
-func TestStopWaitsForInFlightTunnelStart(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "checking")
-	bin := filepath.Join(dir, "fake-sing-box")
-	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"check\" ]; then\n  touch %q\n  sleep 1\n  exit 0\nfi\nif [ \"$1\" = \"run\" ]; then\n  exec sleep 30\nfi\nexit 1\n", marker)
-	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	tunnel := &Tunnel{
-		Slot: 1, Port: 24568, Status: "starting", portMayChange: true,
-		Node: Node{Config: testVPNGateProfile}, Cred: SocksCred{User: "user", Pass: "password"},
-	}
-	started := make(chan error, 1)
-	go func() { started <- tunnel.startSingBox(bin, dir) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("假 sing-box 未进入配置校验")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	tunnel.stop()
-	if err := <-started; err != nil {
-		t.Fatalf("启动不应因并发 Stop 返回错误: %v", err)
-	}
-	if tunnel.snapshot().Status != "stopped" {
-		t.Fatal("Stop 后隧道状态不是 stopped")
-	}
-	if tunnel.proc == nil || !tunnel.proc.exited() {
-		t.Fatal("Stop 后启动中的 sing-box 子进程仍在运行")
-	}
-}
-
 func TestSaveStateSerializesConcurrentWrites(t *testing.T) {
 	dir := t.TempDir()
 	manager := &Manager{
@@ -219,6 +182,36 @@ func TestSaveStatePersistsPendingPortFlag(t *testing.T) {
 	}
 	if len(state.Tunnels) != 1 || !state.Tunnels[0].PortPending {
 		t.Fatalf("pending public port should not be fixed: %+v", state)
+	}
+}
+
+func TestStoppedExitPersistsAndCanBeRestored(t *testing.T) {
+	dir := t.TempDir()
+	tunnel := &Tunnel{Slot: 1, RouteID: "exit-stopped", Port: 24568, Status: "stopped",
+		Node: Node{HostName: "jp1", CountryCode: "JP", Config: "profile"},
+		Cred: SocksCred{User: "user", Pass: "password"}}
+	m := &Manager{workDir: dir, maxSlots: 2, tunnels: map[int]*Tunnel{1: tunnel}}
+	if err := m.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	m2 := NewManager(2, dir)
+	count, err := m2.restoreState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || len(m2.Tunnels()) != 1 {
+		t.Fatalf("恢复出口数量错误: count=%d tunnels=%d", count, len(m2.Tunnels()))
+	}
+	state := m2.Tunnels()[0].snapshot()
+	if state.Status != "stopped" || state.Port != tunnel.Port || state.RouteID != tunnel.RouteID {
+		t.Fatalf("停止出口未按原状态恢复: %+v", state)
+	}
+}
+
+func TestStoppedExitReservesPublicPort(t *testing.T) {
+	stopped := &Tunnel{Port: 24569, Status: "stopped"}
+	if !tunnelUsesTCPPort([]*Tunnel{stopped}, stopped.Port) {
+		t.Fatal("停止出口的 SOCKS5 端口不应被新的入站占用")
 	}
 }
 

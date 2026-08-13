@@ -220,6 +220,13 @@ func (e *embeddedEngine) hasInbound(id int, tag string) bool {
 	return found && state.tag == tag && e.box != nil
 }
 
+func (e *embeddedEngine) hasTunnel(slot int) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, found := e.tunnels[slot]
+	return found && e.box != nil
+}
+
 func (e *embeddedEngine) createInbound(inbound *nativeInbound) error {
 	options, err := decodeSingBoxOptions[eoptionInbound](e.ctx, singBoxInboundJSON(inbound))
 	if err != nil {

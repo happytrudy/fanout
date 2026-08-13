@@ -98,14 +98,13 @@ func ipv6Unavailable(err error) bool {
 	return errors.Is(err, syscall.EAFNOSUPPORT) || strings.Contains(strings.ToLower(err.Error()), "address family not supported")
 }
 
-// tunnelTCPPorts returns every public SOCKS port reserved by a live or
-// connecting tunnel. Starting exits have not necessarily bound yet, so OS
-// probing alone cannot prevent an inbound from stealing their port.
+// tunnelTCPPorts returns every public SOCKS port reserved by a saved tunnel,
+// including explicitly stopped exits that may be started again later.
 func tunnelTCPPorts(tunnels []*Tunnel) map[int]bool {
 	ports := make(map[int]bool, len(tunnels))
 	for _, tunnel := range tunnels {
 		state := tunnel.snapshot()
-		if state.Status != "stopped" && state.Port >= 1 && state.Port <= 65535 {
+		if state.Port >= 1 && state.Port <= 65535 {
 			ports[state.Port] = true
 		}
 	}

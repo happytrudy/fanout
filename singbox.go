@@ -339,6 +339,65 @@ func (p *singBoxProc) reapOrphan() {
 	_ = os.Remove(p.pidPath())
 }
 
+// reapLegacySingBoxProcesses removes child processes left by fanout releases
+// before v5. Those releases stored one PID and one same-named JSON config per
+// child under workDir/sing-box. The embedded engine does not use this folder.
+// A PID is signaled only when its live command line still points at the exact
+// sibling config file, so unrelated sing-box services are never selected by a
+// broad process-name match.
+func reapLegacySingBoxProcesses(workDir string) int {
+	dir := filepath.Join(workDir, "sing-box")
+	pidFiles, err := filepath.Glob(filepath.Join(dir, "*.pid"))
+	if err != nil {
+		return 0
+	}
+	reaped := 0
+	for _, pidPath := range pidFiles {
+		blob, err := os.ReadFile(pidPath)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(blob)))
+		if err != nil || pid <= 1 {
+			_ = os.Remove(pidPath)
+			continue
+		}
+		name := strings.TrimSuffix(filepath.Base(pidPath), ".pid")
+		configPath := filepath.Join(dir, name+".json")
+		if legacyProcessOwnsConfig(pid, configPath) {
+			if proc, err := os.FindProcess(pid); err == nil {
+				_ = proc.Signal(syscall.SIGTERM)
+				if !waitPIDExit(pid, 3*time.Second) {
+					_ = proc.Signal(syscall.SIGKILL)
+					_ = waitPIDExit(pid, time.Second)
+				}
+				reaped++
+			}
+		}
+		_ = os.Remove(pidPath)
+	}
+	return reaped
+}
+
+func legacyProcessOwnsConfig(pid int, configPath string) bool {
+	blob, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(string(blob), "\x00")
+	hasRun := false
+	hasConfig := false
+	for i, arg := range args {
+		if arg == "run" {
+			hasRun = true
+		}
+		if i+1 < len(args) && (arg == "-c" || arg == "--config") && args[i+1] == configPath {
+			hasConfig = true
+		}
+	}
+	return hasRun && hasConfig
+}
+
 func (p *singBoxProc) ownsPID(pid int) bool {
 	blob, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {

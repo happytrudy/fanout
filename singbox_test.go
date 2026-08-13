@@ -1,9 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestCompareSingBoxVersion(t *testing.T) {
@@ -29,6 +33,58 @@ func TestCompareSingBoxVersion(t *testing.T) {
 			t.Errorf("compare %s to minimum: got %d, want sign %d", tc.version, cmp, tc.want)
 		}
 	}
+}
+
+func TestReapLegacySingBoxProcesses(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sing-box")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "inbound-1.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(dir, "legacy-sing-box")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helper, "run", "-c", configPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
+	pidPath := filepath.Join(dir, "inbound-1.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := reapLegacySingBoxProcesses(filepath.Dir(dir)); got != 1 {
+		t.Fatalf("清理数量 = %d, want 1 (pid=%d cmd=%s)", got, cmd.Process.Pid, fmt.Sprint(cmd.Args))
+	}
+	deadline := time.Now().Add(time.Second)
+	for processAlive(cmd.Process.Pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processAlive(cmd.Process.Pid) {
+		t.Fatal("旧版子进程仍在运行")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("旧 PID 文件未删除: %v", err)
+	}
+}
+
+func processAlive(pid int) bool {
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
 }
 
 func TestSingBoxCandidatesCustomName(t *testing.T) {

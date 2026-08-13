@@ -33,6 +33,7 @@ type Native struct {
 	lastTunnels    []*Tunnel
 	closed         bool
 	runtimeError   map[int]string
+	pausedInbound  map[int]string
 }
 
 type inboundReconcileError struct {
@@ -69,6 +70,9 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 		return nil, err
 	}
 	_ = binary // Native is linked with sing-box; no external binary is used.
+	if count := reapLegacySingBoxProcesses(workDir); count > 0 {
+		log.Printf("已清理 %d 个旧版 sing-box 子进程", count)
+	}
 	store, err := loadNativeStore(workDir)
 	if err != nil {
 		return nil, err
@@ -99,6 +103,7 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, bina
 		engine:         engine,
 		configHash:     make(map[int][sha256.Size]byte),
 		runtimeError:   make(map[int]string),
+		pausedInbound:  make(map[int]string),
 	}
 	return n, nil
 }
@@ -126,6 +131,9 @@ func (n *Native) reconcile(tunnels []*Tunnel, persist bool) error {
 	if n.runtimeError == nil {
 		n.runtimeError = make(map[int]string)
 	}
+	if n.pausedInbound == nil {
+		n.pausedInbound = make(map[int]string)
+	}
 	// Upgrade hostname-based bindings from earlier releases. Route IDs stay
 	// stable across VPN Gate node swaps and avoid rewriting gateway routes.
 	legacy := make(map[string]string, len(tunnels))
@@ -141,7 +149,12 @@ func (n *Native) reconcile(tunnels []*Tunnel, persist bool) error {
 
 	list := n.store.sorted()
 	render := make([]*nativeInbound, 0, len(list))
+	paused := make(map[int]string)
 	for _, inbound := range list {
+		if inbound.Enable && inbound.BoundTo != "" && !n.boundTunnelReady(inbound.BoundTo, tunnels) {
+			paused[inbound.ID] = "绑定出口未连通，入站已停止监听"
+			continue
+		}
 		copyInbound := *inbound
 		copyInbound.Listen = n.listenAddr
 		render = append(render, &copyInbound)
@@ -154,8 +167,15 @@ func (n *Native) reconcile(tunnels []*Tunnel, persist bool) error {
 		if !inbound.Enable {
 			delete(n.configHash, inbound.ID)
 			delete(n.runtimeError, inbound.ID)
+			delete(n.pausedInbound, inbound.ID)
 			continue
 		}
+		if reason := paused[inbound.ID]; reason != "" {
+			n.pausedInbound[inbound.ID] = reason
+			delete(n.runtimeError, inbound.ID)
+			continue
+		}
+		delete(n.pausedInbound, inbound.ID)
 		hash, hashErr := embeddedInboundHash(&nativeInbound{ID: inbound.ID, Port: inbound.Port, Listen: n.listenAddr, Protocol: inbound.Protocol, Network: inbound.Network, Path: inbound.Path, Host: inbound.Host, Security: inbound.Security, TLS: inbound.TLS, Reality: inbound.Reality, Remark: inbound.Remark, Enable: inbound.Enable, Clients: inbound.Clients, BoundTo: inbound.BoundTo})
 		if failure := failures[inbound.ID]; failure != nil {
 			n.runtimeError[inbound.ID] = failure.Error()
@@ -176,6 +196,15 @@ func (n *Native) reconcile(tunnels []*Tunnel, persist bool) error {
 		return nil
 	}
 	return n.store.save(n.dir)
+}
+
+func (n *Native) boundTunnelReady(binding string, tunnels []*Tunnel) bool {
+	for _, tunnel := range tunnels {
+		if tunnelBinding(tunnel) == binding && tunnel.snapshot().Status == "up" && n.engine.hasTunnel(tunnel.snapshot().Slot) {
+			return true
+		}
+	}
+	return false
 }
 
 // commitMutation applies a changed store. If sing-box rejects or cannot start
@@ -332,6 +361,9 @@ func (n *Native) inboundRuntime(inbound *nativeInbound) (string, string, time.Ti
 	runtimeErr := n.runtimeError[inbound.ID]
 	if runtimeErr != "" {
 		return "stopped", runtimeErr, time.Time{}
+	}
+	if reason := n.pausedInbound[inbound.ID]; reason != "" {
+		return "stopped", reason, time.Time{}
 	}
 	if n.engine != nil && n.engine.hasInbound(inbound.ID, inbound.tag()) {
 		return "running", "", time.Time{}

@@ -139,9 +139,8 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 
 // bringUp 把一条隧道拉起来。
 //
-// notify 决定成功后是否立刻重建后端配置。换节点重连时要传 false：
-// 那条路径随后会调 rebind/resync 把入站改绑到新节点，在那之前重建配置
-// 会因为入站还指着旧节点名而把路由规则丢掉。
+// notify 决定成功后是否立刻刷新内嵌后端。换节点重连时由 reconnect
+// 在停止 endpoint 后先暂停绑定入站，成功后再通过 rebind/resync 恢复。
 func (m *Manager) bringUp(t *Tunnel, notify bool) {
 	m.bringUpPersist(t, notify, false)
 }
@@ -259,7 +258,7 @@ func (m *Manager) tryNode(t *Tunnel) error {
 	}
 	t.setEngine(engine)
 	portWasPending := t.publicPortMayChange()
-	if err := t.startSingBox("", m.workDir); err != nil {
+	if err := t.startSingBox(); err != nil {
 		return err
 	}
 	// A first listener may have had to choose a different random port after a
@@ -351,7 +350,8 @@ func (m *Manager) candidatesFor(first Node) []Node {
 	return out
 }
 
-// Stop 停掉一条隧道并释放槽位。
+// Stop pauses one exit while preserving its slot, public port, credentials and
+// inbound bindings. Delete is the operation that releases the slot.
 func (m *Manager) Stop(slot int) error {
 	invalidateInbounds()
 	m.mu.RLock()
@@ -360,23 +360,96 @@ func (m *Manager) Stop(slot int) error {
 	if !ok {
 		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
-	// Serialize Stop with a credential update. The manager entry must remain
-	// visible until the credential update has either persisted or rolled back.
 	t.adminMu.Lock()
 	defer t.adminMu.Unlock()
-	m.mu.Lock()
-	if m.tunnels[slot] != t {
-		m.mu.Unlock()
+	if !m.tunnelOwned(t) {
 		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
-	delete(m.tunnels, slot)
-	m.mu.Unlock()
+	if t.snapshot().Status == "stopped" {
+		return nil
+	}
 	t.stopLocked()
 	if err := m.saveState(); err != nil {
 		return fmt.Errorf("出口已停止，但保存状态失败: %w", err)
 	}
 	m.notifyPanel()
 	return nil
+}
+
+// Restart resumes a stopped or failed exit without changing its public port,
+// credentials, route ID or inbound bindings.
+func (m *Manager) Restart(slot int) error {
+	invalidateInbounds()
+	m.mu.RLock()
+	t, ok := m.tunnels[slot]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("槽位 %d 没有已保存的出口", slot)
+	}
+	t.adminMu.Lock()
+	defer t.adminMu.Unlock()
+	if !m.tunnelOwned(t) {
+		return fmt.Errorf("槽位 %d 没有已保存的出口", slot)
+	}
+	state := t.snapshot()
+	if state.Status == "up" || state.Status == "starting" {
+		return fmt.Errorf("出口当前状态为 %s，无需重新启动", state.Status)
+	}
+	if !t.reconnectMu.TryLock() {
+		return fmt.Errorf("这个出口正在执行其他操作，稍等一下")
+	}
+	t.stateMu.Lock()
+	t.Status, t.Err, t.ExitIP, t.Since = "starting", "", "", time.Now()
+	t.stateMu.Unlock()
+	if err := m.saveState(); err != nil {
+		t.stateMu.Lock()
+		t.Status = state.Status
+		t.Err = state.Err
+		t.ExitIP = state.ExitIP
+		t.Since = state.Since
+		t.stateMu.Unlock()
+		t.reconnectMu.Unlock()
+		return fmt.Errorf("保存出口启动状态失败: %w", err)
+	}
+	m.notifyPanel()
+	go func() {
+		defer t.reconnectMu.Unlock()
+		m.bringUpPersist(t, true, false)
+	}()
+	return nil
+}
+
+// Delete permanently removes an exit record and releases its slot.
+func (m *Manager) Delete(slot int) error {
+	invalidateInbounds()
+	m.mu.RLock()
+	t, ok := m.tunnels[slot]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("槽位 %d 没有出口", slot)
+	}
+	t.adminMu.Lock()
+	defer t.adminMu.Unlock()
+	m.mu.Lock()
+	if m.tunnels[slot] != t {
+		m.mu.Unlock()
+		return fmt.Errorf("槽位 %d 没有出口", slot)
+	}
+	delete(m.tunnels, slot)
+	m.mu.Unlock()
+	t.stopLocked()
+	if err := m.saveState(); err != nil {
+		return fmt.Errorf("出口已删除，但保存状态失败: %w", err)
+	}
+	m.notifyPanel()
+	return nil
+}
+
+func (m *Manager) tunnelOwned(t *Tunnel) bool {
+	m.mu.RLock()
+	current, ok := m.tunnels[t.Slot]
+	m.mu.RUnlock()
+	return ok && current == t
 }
 
 // Swap 把一条隧道换到同地区的另一个节点上，端口与已分发的客户端配置保持不变。
@@ -406,7 +479,7 @@ func (m *Manager) Swap(slot int) error {
 	return nil
 }
 
-// StopAll 停掉所有隧道并清空状态文件。
+// StopAll pauses every exit but preserves their saved definitions.
 func (m *Manager) StopAll() {
 	for _, t := range m.Tunnels() {
 		_ = m.Stop(t.Slot)
@@ -449,11 +522,11 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 		return SocksCred{}, fmt.Errorf("内嵌 sing-box 不可用")
 	}
 	previous := t.credential()
-	if err := t.restartWithCredential("", m.workDir, cred); err != nil {
+	if err := t.restartWithCredential(cred); err != nil {
 		return SocksCred{}, err
 	}
 	if err := m.saveState(); err != nil {
-		if rollbackErr := t.restartWithCredential("", m.workDir, previous); rollbackErr != nil {
+		if rollbackErr := t.restartWithCredential(previous); rollbackErr != nil {
 			return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败: %w；恢复旧凭据也失败: %v", err, rollbackErr)
 		}
 		return SocksCred{}, fmt.Errorf("保存新 SOCKS5 凭据失败，已恢复旧凭据: %w", err)

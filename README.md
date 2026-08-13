@@ -165,6 +165,9 @@ f uninstall  # 卸载
 留空端口时新建/复制的入站；已有端口和手动填写的端口不会自动修改。
 
 隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。
+停止出口会关闭当前 OpenVPN/SOCKS5 监听以及绑定到它的协议入站，同时保留出口记录、端口、
+凭据和绑定关系；刷新后可直接重新启动，出口连通后绑定入站自动恢复监听。只有界面中的删除
+按钮才会永久移除出口并释放端口。
 
 健康检查每 10 秒经当前出口查询一次 IP，比对是否仍为建立时的出口。连续两次失败或
 不符就自动换节点重连，槽位和端口不变，原先指向它的节点链接会自动改绑过去。
@@ -182,8 +185,12 @@ f uninstall  # 卸载
   Nginx 反代时应保留原始 Host（其中前两行是必须的）：
 
   ```nginx
+  location = /<随机访问路径> {
+      return 307 /<随机访问路径>/;
+  }
+
   location /<随机访问路径>/ {
-      proxy_pass http://127.0.0.1:8899/<随机访问路径>/;
+      proxy_pass http://127.0.0.1:8899;
       proxy_set_header Host $host;
       proxy_set_header X-Forwarded-Host $host;
       proxy_set_header X-Forwarded-Proto $scheme;

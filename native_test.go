@@ -26,9 +26,54 @@ func newNativeForEmbeddedTest(t *testing.T, store *nativeStore) *Native {
 		engine:         engine,
 		configHash:     make(map[int][sha256.Size]byte),
 		runtimeError:   make(map[int]string),
+		pausedInbound:  make(map[int]string),
 	}
 	t.Cleanup(native.Close)
 	return native
+}
+
+func TestNativeStopsBoundInboundWhenExitIsNotUp(t *testing.T) {
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 24011, Protocol: "vless", Network: "tcp", Enable: true, BoundTo: "exit-one",
+		Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}},
+	}}})
+	tunnel := &Tunnel{Slot: 1, RouteID: "exit-one", Status: "stopped"}
+	if err := native.apply([]*Tunnel{tunnel}); err != nil {
+		t.Fatal(err)
+	}
+	if native.engine.hasInbound(1, "in-24011-tcp") {
+		t.Fatal("停止出口绑定的入站不应继续监听")
+	}
+	list, err := native.Inbounds(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].RuntimeStatus != "stopped" || !strings.Contains(list[0].RuntimeError, "绑定出口未连通") {
+		t.Fatalf("绑定出口停用时的入站状态错误: %+v", list[0])
+	}
+}
+
+func TestNativeRestoresBoundInboundWhenExitComesUp(t *testing.T) {
+	native := newNativeForEmbeddedTest(t, &nativeStore{NextID: 2, Inbounds: []*nativeInbound{{
+		ID: 1, Port: 24012, Protocol: "vless", Network: "tcp", Enable: true, BoundTo: "exit-one",
+		Clients: []nativeClient{{Email: "one", ID: newUUID(), Enable: true}},
+	}}})
+	tunnel := &Tunnel{Slot: 1, RouteID: "exit-one", Status: "stopped"}
+	if err := native.apply([]*Tunnel{tunnel}); err != nil {
+		t.Fatal(err)
+	}
+	native.engine.mu.Lock()
+	native.engine.tunnels[1] = embeddedTunnelState{endpointTag: "test-endpoint"}
+	native.engine.mu.Unlock()
+	tunnel.stateMu.Lock()
+	tunnel.Status = "up"
+	tunnel.stateMu.Unlock()
+	if err := native.OnTunnelsChanged([]*Tunnel{tunnel}); err != nil {
+		t.Fatal(err)
+	}
+	if !native.engine.hasInbound(1, "in-24012-tcp") {
+		t.Fatal("出口恢复后绑定入站应重新开始监听")
+	}
 }
 
 func TestNativeInboundTagStable(t *testing.T) {

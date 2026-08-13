@@ -147,6 +147,9 @@ func (m *Manager) reconnect(t *Tunnel, oldHost string, replacement *Node) bool {
 	t.stateMu.Unlock()
 
 	t.stopEngine()
+	// The bound proxy inbounds must stop listening for the whole reconnect
+	// window. Once the endpoint is up, syncAfterReconnect registers them again.
+	m.notifyPanel()
 
 	go func() {
 		defer t.reconnectMu.Unlock()

@@ -77,3 +77,39 @@ func TestReconnectRejectsConcurrentAttempt(t *testing.T) {
 		t.Fatal("已有重连在进行时，不应启动第二个重连任务")
 	}
 }
+
+func TestManagerStopPreservesExitAndDeleteReleasesIt(t *testing.T) {
+	dir := t.TempDir()
+	configurePanel(dir)
+	defer closePanel()
+	tunnel := &Tunnel{
+		Slot: 1, RouteID: "exit-one", Port: 24570, Status: "up",
+		Node: Node{HostName: "jp1", CountryCode: "JP", Config: "profile"},
+		Cred: SocksCred{User: "user", Pass: "password"},
+	}
+	m := NewManager(2, dir)
+	m.tunnels[1] = tunnel
+	if err := m.Stop(1); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Tunnels()) != 1 || m.Tunnels()[0].snapshot().Status != "stopped" {
+		t.Fatalf("停止后出口应保留: %+v", m.Tunnels())
+	}
+	blob, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state persistedState
+	if err := json.Unmarshal(blob, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tunnels) != 1 || state.Tunnels[0].Status != "stopped" {
+		t.Fatalf("停止状态未持久化: %+v", state)
+	}
+	if err := m.Delete(1); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Tunnels()) != 0 {
+		t.Fatal("永久删除后出口仍占用槽位")
+	}
+}

@@ -13,6 +13,9 @@ type persistedTunnel struct {
 	Slot    int    `json:"slot"`
 	RouteID string `json:"route_id,omitempty"`
 	Port    int    `json:"port"`
+	// Status only persists an explicit user stop. Missing status in legacy
+	// files continues to mean "start automatically".
+	Status string `json:"status,omitempty"`
 	// PortPending is set only before the first successful bind. Its absence in
 	// legacy state files deliberately means the published port is fixed.
 	PortPending bool   `json:"port_pending,omitempty"`
@@ -75,16 +78,16 @@ func (m *Manager) saveState() error {
 	var st persistedState
 	for _, t := range m.Tunnels() {
 		state := t.snapshot()
-		// 只跳过用户主动停掉的。starting/failed 的隧道也要存：
-		// 它们正在重连或等着重试，漏存会让重启后凭空少几个出口。
-		if state.Status == "stopped" {
-			continue
-		}
 		cred := t.credential()
+		persistedStatus := ""
+		if state.Status == "stopped" {
+			persistedStatus = "stopped"
+		}
 		st.Tunnels = append(st.Tunnels, persistedTunnel{
 			Slot:        state.Slot,
 			RouteID:     state.RouteID,
 			Port:        state.Port,
+			Status:      persistedStatus,
 			PortPending: t.publicPortMayChange(),
 			HostName:    state.Node.HostName,
 			CountryCode: state.Node.CountryCode,
@@ -174,12 +177,18 @@ func (m *Manager) restoreState() (int, error) {
 		if err := validateCred(cred); err != nil {
 			return 0, fmt.Errorf("状态文件中槽位 %d 的 SOCKS5 凭据无效: %w", p.Slot, err)
 		}
+		status := "starting"
+		if p.Status == "stopped" {
+			status = "stopped"
+		} else if p.Status != "" {
+			return 0, fmt.Errorf("状态文件中槽位 %d 的状态 %q 无效", p.Slot, p.Status)
+		}
 		t := &Tunnel{
 			Slot:    p.Slot,
 			RouteID: routeID,
 			Port:    p.Port,
 			Node:    node,
-			Status:  "starting",
+			Status:  status,
 			Cred:    cred,
 			// State written while an initial connection was pending is allowed to
 			// select another random port if the original was claimed before bind.
@@ -215,7 +224,9 @@ func (m *Manager) restoreState() (int, error) {
 		return 0, fmt.Errorf("保存恢复后的状态失败: %w", err)
 	}
 	for _, t := range restored {
-		go m.bringUpPersist(t, true, true)
+		if t.snapshot().Status != "stopped" {
+			go m.bringUpPersist(t, true, true)
+		}
 	}
 	return len(st.Tunnels), nil
 }

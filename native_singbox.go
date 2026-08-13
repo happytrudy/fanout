@@ -39,23 +39,15 @@ func buildSingBoxGatewayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map
 		}
 		// This legacy static-config helper is retained for config-generation tests.
 		// The production gateway uses embeddedEngine instead.
-		serverPort := t.internalProxyPort()
-		internal := serverPort != 0
-		if serverPort == 0 {
-			// A restored/test tunnel may not have initialized its child yet;
-			// retain the historical public SOCKS fallback for TCP compatibility.
-			serverPort = state.Port
-		}
+		serverPort := state.Port
 		out := map[string]any{
 			"type": "socks", "tag": tunnelTag(t),
 			"server": "127.0.0.1", "server_port": serverPort,
 		}
-		if !internal {
-			cred := t.credential()
-			if cred.User != "" {
-				out["username"] = cred.User
-				out["password"] = cred.Pass
-			}
+		cred := t.credential()
+		if cred.User != "" {
+			out["username"] = cred.User
+			out["password"] = cred.Pass
 		}
 		outs = append(outs, out)
 	}

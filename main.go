@@ -194,6 +194,8 @@ func main() {
 	mux.HandleFunc("/api/tunnels", apiTunnels(mgr))
 	mux.HandleFunc("/api/start", apiStart(mgr))
 	mux.HandleFunc("/api/stop", apiStop(mgr))
+	mux.HandleFunc("/api/restart", apiRestart(mgr))
+	mux.HandleFunc("/api/delete-exit", apiDeleteExit(mgr))
 	mux.HandleFunc("/api/swap", apiSwap(mgr))
 	mux.HandleFunc("/api/cred", apiCred(mgr))
 	mux.HandleFunc("/api/refresh", apiRefresh(mgr))
@@ -315,6 +317,42 @@ func apiStop(m *Manager) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "已停止"})
+	}
+}
+
+func apiRestart(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
+		slot, err := strconv.Atoi(r.URL.Query().Get("slot"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slot 参数无效"})
+			return
+		}
+		if err := m.Restart(slot); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "正在启动"})
+	}
+}
+
+func apiDeleteExit(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireWriteRequest(w, r) {
+			return
+		}
+		slot, err := strconv.Atoi(r.URL.Query().Get("slot"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slot 参数无效"})
+			return
+		}
+		if err := m.Delete(slot); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "已删除"})
 	}
 }
 

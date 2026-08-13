@@ -494,6 +494,7 @@ const $ = s => document.querySelector(s);
 const ICON = {
   copy:'<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   stop:'<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>',
+  play:'<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></svg>',
   redo:'<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
   ok:'<svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>',
   bad:'<svg viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
@@ -572,9 +573,10 @@ function inboundRuntimeTitle(i){
 function renderExits(){
   const list = $('#list');
   const n = view.exits.length;
+	const active = view.exits.filter(e => e.status === 'up' || e.status === 'starting');
   $('#ecount').textContent = n ? n + ' 个' : '';
   $('#exportAll').disabled = !view.exits.some(e => e.inbounds && e.inbounds.length);
-  $('#stopall').disabled = !n;
+	$('#stopall').disabled = !active.length;
 
   if(!n){
     list.innerHTML = '<div class="empty">还没有出口'
@@ -599,6 +601,10 @@ function renderExits(){
     const socks = e.status === 'up'
       ? socksURL(credHost(e), e.port, e.socks_user, e.socks_pass)
       : (e.status === 'starting' ? 'SOCKS5 连接中…' : 'SOCKS5 不可用');
+	const running = e.status === 'up' || e.status === 'starting';
+	const lifecycle = running
+	  ? '<button class="icon" data-stop="' + e.slot + '" title="停止这个出口">' + ICON.stop + '</button>'
+	  : '<button class="icon" data-restart="' + e.slot + '" title="重新启动这个出口">' + ICON.play + '</button>';
     return '<div class="exit">'
       + '<div class="row">'
       +   '<span class="dot ' + e.status + '" title="' + (STATUS[e.status] || e.status) + '"></span>'
@@ -608,8 +614,9 @@ function renderExits(){
       +   '<span class="socks"><button data-cred="' + e.slot + '" title="点击修改 SOCKS5 凭据">'
       +     ICON.lock + ' ' + esc(socks) + '</button></span>'
       +   '<span class="acts">'
-      +     '<button class="icon" data-swap="' + e.slot + '" title="换一个节点">' + ICON.redo + '</button>'
-      +     '<button class="icon" data-stop="' + e.slot + '" title="停止这个出口">' + ICON.stop + '</button>'
+	  +     (e.status === 'up' ? '<button class="icon" data-swap="' + e.slot + '" title="换一个节点">' + ICON.redo + '</button>' : '')
+	  +     lifecycle
+	  +     '<button class="icon danger" data-delete-exit="' + e.slot + '" title="永久删除这个出口">' + ICON.trash + '</button>'
       +   '</span>'
       + '</div>' + err + '</div>';
   }).join('');
@@ -875,6 +882,27 @@ document.addEventListener('click', async e => {
     poll();
     return;
   }
+	const restart = e.target.closest('[data-restart]');
+	if(restart){
+	  restart.disabled = true;
+	  try{
+		await api('/api/restart?slot=' + restart.dataset.restart, {method:'POST'});
+		toast('正在启动出口');
+	  }catch(err){ toast(err.message, true); }
+	  poll();
+	  return;
+	}
+	const deleteExit = e.target.closest('[data-delete-exit]');
+	if(deleteExit){
+	  if(!confirm('永久删除这个出口？端口、SOCKS5 凭据和出口记录都会删除，此操作不可撤销。')) return;
+	  deleteExit.disabled = true;
+	  try{
+		await api('/api/delete-exit?slot=' + deleteExit.dataset.deleteExit, {method:'POST'});
+		toast('已删除出口');
+	  }catch(err){ toast(err.message, true); }
+	  poll();
+	  return;
+	}
   const swap = e.target.closest('[data-swap]');
   if(swap){
     swap.disabled = true;
@@ -919,9 +947,10 @@ document.addEventListener('click', async e => {
 });
 
 $('#stopall').onclick = async e => {
-  if(!confirm('停止全部 ' + view.exits.length + ' 个出口？')) return;
+	const active = view.exits.filter(x => x.status === 'up' || x.status === 'starting');
+	if(!active.length || !confirm('停止全部 ' + active.length + ' 个运行中出口？出口记录会保留。')) return;
   e.target.disabled = true;
-  for(const x of view.exits){
+	for(const x of active){
     try{ await api('/api/stop?slot=' + x.slot, {method:'POST'}); }catch(err){}
   }
   poll();
