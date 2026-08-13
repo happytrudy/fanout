@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,12 +32,82 @@ func requireWriteRequest(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if origin != "" {
 		u, err := url.Parse(origin)
-		if err != nil || u.Host == "" || u.Host != r.Host {
+		if err != nil || u.Host == "" || !sameRequestHost(u.Host, requestHost(r)) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "跨站请求被拒绝"})
 			return false
 		}
 	}
 	return true
+}
+
+// requestHost returns the browser-visible host for the same-origin check.
+// cloudflared and a local reverse proxy connect from loopback and may replace
+// Host with the local origin address. Only for those trusted local peers may a
+// forwarded host override r.Host; accepting this header from the Internet
+// would let a direct client forge the CSRF check.
+func requestHost(r *http.Request) string {
+	if !isLoopbackPeer(r.RemoteAddr) {
+		return r.Host
+	}
+	if host := firstForwardedHost(r.Header.Get("X-Forwarded-Host")); host != "" {
+		return host
+	}
+	return forwardedHost(r.Header.Get("Forwarded"), r.Host)
+}
+
+func isLoopbackPeer(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func firstForwardedHost(value string) string {
+	if comma := strings.IndexByte(value, ','); comma >= 0 {
+		value = value[:comma]
+	}
+	return strings.Trim(strings.TrimSpace(value), "\"")
+}
+
+func forwardedHost(value, fallback string) string {
+	if comma := strings.IndexByte(value, ','); comma >= 0 {
+		value = value[:comma]
+	}
+	for _, parameter := range strings.Split(value, ";") {
+		name, host, found := strings.Cut(strings.TrimSpace(parameter), "=")
+		if found && strings.EqualFold(strings.TrimSpace(name), "host") {
+			host = strings.Trim(strings.TrimSpace(host), "\"")
+			if host != "" {
+				return host
+			}
+		}
+	}
+	return fallback
+}
+
+func sameRequestHost(originHost, requestHost string) bool {
+	originName, originPort := splitRequestHost(originHost)
+	requestName, requestPort := splitRequestHost(requestHost)
+	if originName == "" || requestName == "" || !strings.EqualFold(originName, requestName) {
+		return false
+	}
+	// A browser omits the default HTTPS port from Origin while proxies may add
+	// it to X-Forwarded-Host. Treat :443 as equivalent to an omitted port.
+	return originPort == requestPort || (originPort == "" && requestPort == "443") || (originPort == "443" && requestPort == "")
+}
+
+func splitRequestHost(host string) (string, string) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", ""
+	}
+	name, port, err := net.SplitHostPort(host)
+	if err == nil {
+		return strings.Trim(name, "[]"), port
+	}
+	return strings.Trim(host, "[]"), ""
 }
 
 func main() {

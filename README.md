@@ -175,7 +175,9 @@ f uninstall  # 卸载
   IPv6-only 目标直接从 VPS IPv6 出口连接；OpenVPN 端不做 NAT64。
 - VPN Gate 是志愿者节点，有相当比例已下线或满员（`AUTH_FAILED`）。
   启动时连不上会自动顺着同地区候选往下试，最多 6 个。
-- 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套一层反代。
+- 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套 HTTPS 反代。Cloudflare
+  Tunnel、cloudflared、Nginx 或 Caddy 运行在本机时可直接使用；fanout 只信任来自
+  `127.0.0.1` / `::1` 的 `X-Forwarded-Host` / `Forwarded`，用于保证反代后的按钮请求仍通过同源校验。
 
 ## 许可
 

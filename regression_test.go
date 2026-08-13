@@ -54,19 +54,36 @@ func TestEmbeddedEndpointInboundUsesHostNetwork(t *testing.T) {
 
 func TestRequireWriteRequest(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		method string
-		origin string
-		code   int
+		name            string
+		method          string
+		origin          string
+		host            string
+		remote          string
+		forward         string
+		standardForward string
+		code            int
 	}{
-		{"get", http.MethodGet, "", http.StatusMethodNotAllowed},
-		{"cross-origin", http.MethodPost, "https://attacker.example", http.StatusForbidden},
-		{"post", http.MethodPost, "", 0},
+		{"get", http.MethodGet, "", "fanout.example", "198.51.100.10:12345", "", "", http.StatusMethodNotAllowed},
+		{"cross-origin", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "", "", http.StatusForbidden},
+		{"post", http.MethodPost, "", "fanout.example", "198.51.100.10:12345", "", "", 0},
+		{"same host normalized", http.MethodPost, "https://PANEL.example", "panel.example:443", "198.51.100.10:12345", "", "", 0},
+		{"cloudflared forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "panel.example", "", 0},
+		{"cloudflared default https port", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "[::1]:12345", "panel.example:443", "", 0},
+		{"standard forwarded host", http.MethodPost, "https://panel.example", "127.0.0.1:8899", "127.0.0.1:12345", "", `for=192.0.2.10;host="panel.example";proto=https`, 0},
+		{"public forwarded header cannot bypass", http.MethodPost, "https://attacker.example", "fanout.example", "198.51.100.10:12345", "attacker.example", "", http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, "http://fanout.example/api/stop", nil)
+			req.Host = tc.host
+			req.RemoteAddr = tc.remote
 			if tc.origin != "" {
 				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.forward != "" {
+				req.Header.Set("X-Forwarded-Host", tc.forward)
+			}
+			if tc.standardForward != "" {
+				req.Header.Set("Forwarded", tc.standardForward)
 			}
 			rec := httptest.NewRecorder()
 			got := requireWriteRequest(rec, req)
