@@ -69,9 +69,6 @@ func openNativeConfigured(workDir, listenAddr string, portMin, portMax int, sock
 	if err := validatePortRange(portMin, portMax); err != nil {
 		return nil, err
 	}
-	if err := validateLocalIPv4(socksListenIP); err != nil {
-		return nil, err
-	}
 	if count := reapLegacySingBoxProcesses(workDir); count > 0 {
 		log.Printf("已清理 %d 个旧版 sing-box 子进程", count)
 	}

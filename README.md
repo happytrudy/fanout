@@ -49,8 +49,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/happytrudy/fanout/main/insta
 ./fanout -ip 203.0.113.10
 ```
 
-不传 `-ip` 时，fanout 会先自动探测公网 IPv4、验证它属于本机网卡后再启动。探测失败或
-指定了不属于本机的地址会直接报错退出；`0.0.0.0` 不是可用于 `-ip` 的地址。
+不传 `-ip` 时，fanout 会自动探测公网 IPv4 并直接使用。手动指定 `-ip` 或
+`FANOUT_PUBLIC_IP` 时，程序会验证该地址属于本机网卡；验证失败会直接报错退出。
+`0.0.0.0` 不是可用于 `-ip` 的地址。
 
 安装脚本从源码编译时默认关闭 CGO，生成不依赖目标机 glibc 版本的静态二进制：
 

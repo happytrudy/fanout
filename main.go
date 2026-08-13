@@ -129,8 +129,10 @@ func main() {
 	showVersion := flag.Bool("version", false, "显示版本后退出")
 	flag.Parse()
 
-	if *publicIP == "" {
+	manualPublicIP := strings.TrimSpace(*publicIP) != ""
+	if !manualPublicIP {
 		*publicIP = os.Getenv("FANOUT_PUBLIC_IP")
+		manualPublicIP = strings.TrimSpace(*publicIP) != ""
 	}
 	*publicIP = strings.TrimSpace(*publicIP)
 
@@ -148,8 +150,10 @@ func main() {
 			log.Fatal("无法自动探测 VPS 公网 IPv4，请使用 -ip 指定")
 		}
 	}
-	if err := validateLocalIPv4(*publicIP); err != nil {
-		log.Fatal(err)
+	if manualPublicIP {
+		if err := validateLocalIPv4(*publicIP); err != nil {
+			log.Fatal(err)
+		}
 	}
 	setPublicIPOverride(*publicIP)
 	webCfg, err := loadWebSettings(*workDir, *webPort)
